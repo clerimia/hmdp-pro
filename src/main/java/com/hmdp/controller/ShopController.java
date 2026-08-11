@@ -36,6 +36,26 @@ public class ShopController {
     }
 
     /**
+     * 读链路压测对照：黑马原版 Redis → MySQL（不含 Caffeine / 网关 L1）
+     */
+    @GetMapping("/benchmark/redis/{id}")
+    public Result queryShopByIdHeimaRedis(@PathVariable("id") Long id) {
+        return shopService.queryByIdHeimaRedis(id);
+    }
+
+    /**
+     * 读链路压测对照：直查 MySQL（仅辅助）
+     */
+    @GetMapping("/benchmark/db/{id}")
+    public Result queryShopByIdFromDb(@PathVariable("id") Long id) {
+        Shop shop = shopService.getById(id);
+        if (shop == null) {
+            return Result.fail("店铺不存在！");
+        }
+        return Result.ok(shop);
+    }
+
+    /**
      * 新增商铺信息
      * @param shop 商铺数据
      * @return 商铺id

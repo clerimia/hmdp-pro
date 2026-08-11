@@ -1,6 +1,7 @@
 package com.hmdp.entity;
 
 import com.baomidou.mybatisplus.annotation.IdType;
+import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
 import lombok.Data;
@@ -77,5 +78,10 @@ public class VoucherOrder implements Serializable {
      */
     private LocalDateTime updateTime;
 
+    /**
+     * 秒杀方案标记（仅 MQ 消息体使用，不入库）：A / B
+     */
+    @TableField(exist = false)
+    private String seckillMode;
 
 }

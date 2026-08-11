@@ -8,6 +8,7 @@ import com.hmdp.entity.Shop;
 import com.hmdp.mapper.ShopMapper;
 import com.hmdp.service.IShopService;
 import com.hmdp.utils.CacheClient;
+import com.hmdp.utils.MultiLevelCacheService;
 import com.hmdp.utils.SystemConstants;
 import org.springframework.data.geo.Distance;
 import org.springframework.data.geo.GeoResult;
@@ -42,24 +43,31 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     @Resource
     private CacheClient cacheClient;
 
+    @Resource
+    private MultiLevelCacheService multiLevelCache;
+
     @Override
     public Result queryById(Long id) {
-        // 解决缓存穿透
-        Shop shop = cacheClient
-                .queryWithPassThrough(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
-
-        // 互斥锁解决缓存击穿
-        // Shop shop = cacheClient
-        //         .queryWithMutex(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
-
-        // 逻辑过期解决缓存击穿
-        // Shop shop = cacheClient
-        //         .queryWithLogicalExpire(CACHE_SHOP_KEY, id, Shop.class, this::getById, 20L, TimeUnit.SECONDS);
+        // 多级缓存：Caffeine(L1 JVM) → Redis逻辑过期(L2) → MySQL(L3)
+        Shop shop = multiLevelCache
+                .queryWithMultiLevel(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
 
         if (shop == null) {
             return Result.fail("店铺不存在！");
         }
-        // 7.返回
+        return Result.ok(shop);
+    }
+
+    /**
+     * 黑马原版读路径对照：仅 Redis → MySQL（无 Caffeine / 无网关 L1）
+     */
+    @Override
+    public Result queryByIdHeimaRedis(Long id) {
+        Shop shop = cacheClient
+                .queryWithPassThrough(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
+        if (shop == null) {
+            return Result.fail("店铺不存在！");
+        }
         return Result.ok(shop);
     }
 
@@ -72,8 +80,8 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         }
         // 1.更新数据库
         updateById(shop);
-        // 2.删除缓存
-        stringRedisTemplate.delete(CACHE_SHOP_KEY + id);
+        // 2.删除多级缓存（Caffeine + Redis）
+        multiLevelCache.evict(CACHE_SHOP_KEY, id);
         return Result.ok();
     }
 

@@ -9,10 +9,10 @@
         <relativePath/> <!-- lookup parent from repository -->
     </parent>
     <groupId>com.hmdp</groupId>
-    <artifactId>hm-dianping</artifactId>
+    <artifactId>hmdp-pro</artifactId>
     <version>0.0.1-SNAPSHOT</version>
-    <name>hm-dianping</name>
-    <description>Demo project for Spring Boot</description>
+    <name>hmdp-pro</name>
+    <description>hm-dianping seckill enhancement (no AI / no docs)</description>
     <properties>
         <java.version>1.8</java.version>
     </properties>
@@ -82,6 +82,18 @@
             <groupId>org.redisson</groupId>
             <artifactId>redisson</artifactId>
             <version>3.13.6</version>
+        </dependency>
+        <!--caffeine 本地缓存（读写链路 L1）-->
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+            <version>2.9.3</version>
+        </dependency>
+        <!--rocketmq 消息队列（秒杀异步落库 / 事务消息 / Canal）-->
+        <dependency>
+            <groupId>org.apache.rocketmq</groupId>
+            <artifactId>rocketmq-client</artifactId>
+            <version>4.9.7</version>
         </dependency>
     </dependencies>
 

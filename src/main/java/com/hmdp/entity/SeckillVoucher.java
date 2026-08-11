@@ -38,6 +38,11 @@ public class SeckillVoucher implements Serializable {
     private Integer stock;
 
     /**
+     * 初始库存（对账账本：秒杀结束库存重算的基准，发布时与 stock 一致）
+     */
+    private Integer initialStock;
+
+    /**
      * 创建时间
      */
     private LocalDateTime createTime;

@@ -218,6 +218,9 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
     private void queryBlogUser(Blog blog) {
         Long userId = blog.getUserId();
         User user = userService.getById(userId);
+        if (user == null) {
+            return;
+        }
         blog.setName(user.getNickName());
         blog.setIcon(user.getIcon());
     }

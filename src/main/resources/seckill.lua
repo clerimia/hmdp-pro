@@ -13,8 +13,9 @@ local stockKey = 'seckill:stock:' .. voucherId
 local orderKey = 'seckill:order:' .. voucherId
 
 -- 3.脚本业务
--- 3.1.判断库存是否充足 get stockKey
-if(tonumber(redis.call('get', stockKey)) <= 0) then
+-- 3.1.判断库存是否充足 get stockKey（key 不存在视为无库存，避免 tonumber(nil) 报错）
+local stock = tonumber(redis.call('get', stockKey))
+if stock == nil or stock <= 0 then
     -- 3.2.库存不足，返回1
     return 1
 end
@@ -27,6 +28,7 @@ end
 redis.call('incrby', stockKey, -1)
 -- 3.5.下单（保存用户）sadd orderKey userId
 redis.call('sadd', orderKey, userId)
--- 3.6.发送消息到队列中， XADD stream.orders * k1 v1 k2 v2 ...
-redis.call('xadd', 'stream.orders', '*', 'userId', userId, 'voucherId', voucherId, 'id', orderId)
+-- 3.6.写事务标记：与扣库存同脚本原子；供 RocketMQ 事务回查（TTL 1 小时）
+redis.call('set', 'seckill:txn:' .. orderId, '1', 'EX', 3600)
+-- 3.7.返回0：校验通过，由事务消息 COMMIT 后投递，异步落库
 return 0

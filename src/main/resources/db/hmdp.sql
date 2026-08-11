@@ -88,6 +88,7 @@ DROP TABLE IF EXISTS `tb_seckill_voucher`;
 CREATE TABLE `tb_seckill_voucher`  (
   `voucher_id` bigint(20) UNSIGNED NOT NULL COMMENT '关联的优惠券的id',
   `stock` int(8) NOT NULL COMMENT '库存',
+  `initial_stock` int(8) NOT NULL DEFAULT 0 COMMENT '初始库存（对账账本：秒杀结束库存重算的基准，发布时与 stock 一致）',
   `create_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   `begin_time` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00' COMMENT '生效时间',
   `end_time` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00' COMMENT '失效时间',
@@ -255,7 +256,8 @@ CREATE TABLE `tb_voucher_order`  (
   `use_time` timestamp NULL DEFAULT NULL COMMENT '核销时间',
   `refund_time` timestamp NULL DEFAULT NULL COMMENT '退款时间',
   `update_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
-  PRIMARY KEY (`id`) USING BTREE
+  PRIMARY KEY (`id`) USING BTREE,
+  UNIQUE INDEX `uk_user_voucher`(`user_id`, `voucher_id`) USING BTREE
 ) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_general_ci ROW_FORMAT = Compact;
 
 -- ----------------------------

@@ -49,6 +49,8 @@ public class VoucherServiceImpl extends ServiceImpl<VoucherMapper, Voucher> impl
         SeckillVoucher seckillVoucher = new SeckillVoucher();
         seckillVoucher.setVoucherId(voucher.getId());
         seckillVoucher.setStock(voucher.getStock());
+        // 初始库存与当前库存一致：对账库存重算的基准（initial_stock 不可变）
+        seckillVoucher.setInitialStock(voucher.getStock());
         seckillVoucher.setBeginTime(voucher.getBeginTime());
         seckillVoucher.setEndTime(voucher.getEndTime());
         seckillVoucherService.save(seckillVoucher);

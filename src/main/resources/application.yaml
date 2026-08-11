@@ -2,16 +2,16 @@ server:
   port: 8081
 spring:
   application:
-    name: hmdp
+    name: hmdp-pro
   datasource:
     driver-class-name: com.mysql.jdbc.Driver
-    url: jdbc:mysql://127.0.0.1:3306/hmdp?useSSL=false&serverTimezone=UTC
-    username: root
-    password: 123
+    url: jdbc:mysql://127.0.0.1:3306/hmdp?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true
+    username: your_mysql_user
+    password: your_mysql_password
   redis:
-    host: 192.168.150.101
+    host: your_redis_host
     port: 6379
-    password: 123321
+    # password: your_redis_password
     lettuce:
       pool:
         max-active: 10
@@ -22,8 +22,18 @@ spring:
     default-property-inclusion: non_null # JSON处理时忽略非空字段
 mybatis-plus:
   type-aliases-package: com.hmdp.entity # 别名扫描包
+# ===== RocketMQ 消息队列 =====
+rocketmq:
+  name-server: 127.0.0.1:9876
+# ===== 秒杀方案：A=入口预扣+事务消息；B=限流入队+消费者校验 =====
+seckill:
+  mode: A
+  # 二级限流第二层：业务滑动窗口（第一层在 OpenResty 网关令牌桶）
+  rate-limit:
+    sliding-window:
+      enabled: true
+      window-ms: 1000      # 窗口 1 秒
+      max-requests: 5      # 同一用户窗口内最多 5 次秒杀请求
 logging:
   level:
-    com.hmdp: debug
-  pattern:
-    dateformat: mm:ss.SSS
+    com.hmdp: info
