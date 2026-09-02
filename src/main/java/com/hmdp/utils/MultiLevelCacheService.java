@@ -1,10 +1,11 @@
 package com.hmdp.utils;
 
-import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
 import com.github.benmanes.caffeine.cache.Cache;
 import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
@@ -34,6 +35,9 @@ public class MultiLevelCacheService {
 
     @Resource
     private StringRedisTemplate stringRedisTemplate;
+
+    @Resource
+    private RedissonClient redissonClient;
 
     @Resource
     private Cache<String, Object> shopLocalCache;
@@ -125,11 +129,11 @@ public class MultiLevelCacheService {
             Function<ID, R> dbFallback, Long ttl, TimeUnit unit) {
 
         String key = keyPrefix + id;
-        String lockKey = LOCK_SHOP_KEY + id;
+        RLock lock = redissonClient.getLock(LOCK_SHOP_KEY + id);
 
         try {
             // 获取互斥锁
-            boolean locked = tryLock(lockKey);
+            boolean locked = lock.tryLock();
             if (!locked) {
                 // 拿不到锁 → 短暂休眠后递归重试
                 Thread.sleep(50);
@@ -161,7 +165,10 @@ public class MultiLevelCacheService {
             Thread.currentThread().interrupt();
             return dbFallback.apply(id);
         } finally {
-            unlock(LOCK_SHOP_KEY + id);
+            // 仅当前线程持有时释放，避免递归重试路径误删他人持有的锁
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
         }
     }
 
@@ -171,18 +178,19 @@ public class MultiLevelCacheService {
     private <R, ID> void rebuildAsync(
             String keyPrefix, ID id, Function<ID, R> dbFallback, Long ttl, TimeUnit unit) {
 
-        String lockKey = LOCK_SHOP_KEY + id;
-        boolean locked = tryLock(lockKey);
-        if (!locked) return; // 已经有别的线程在重建
-
+        RLock lock = redissonClient.getLock(LOCK_SHOP_KEY + id);
         REBUILD_EXECUTOR.submit(() -> {
+            // 在重建线程内加锁，保证锁的持有与释放为同一线程
+            if (!lock.tryLock()) {
+                return; // 已经有别的线程在重建
+            }
             try {
                 R data = dbFallback.apply(id);
                 if (data != null) {
                     writeWithLogicalExpire(keyPrefix + id, data, ttl, unit);
                 }
             } finally {
-                unlock(lockKey);
+                lock.unlock();
             }
         });
     }
@@ -198,15 +206,5 @@ public class MultiLevelCacheService {
         long jitter = (long) (baseSec * 0.2 * RANDOM.nextDouble());
         redisData.setExpireTime(LocalDateTime.now().plusSeconds(baseSec + jitter));
         stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(redisData));
-    }
-
-    private boolean tryLock(String key) {
-        Boolean ok = stringRedisTemplate.opsForValue()
-                .setIfAbsent(key, "1", 10, TimeUnit.SECONDS);
-        return BooleanUtil.isTrue(ok);
-    }
-
-    private void unlock(String key) {
-        stringRedisTemplate.delete(key);
     }
 }

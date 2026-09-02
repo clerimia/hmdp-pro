@@ -1,10 +1,11 @@
 package com.hmdp.utils;
 
-import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
 import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
@@ -22,11 +23,13 @@ import static com.hmdp.utils.RedisConstants.LOCK_SHOP_KEY;
 public class CacheClient {
 
     private final StringRedisTemplate stringRedisTemplate;
+    private final RedissonClient redissonClient;
 
     private static final ExecutorService CACHE_REBUILD_EXECUTOR = Executors.newFixedThreadPool(10);
 
-    public CacheClient(StringRedisTemplate stringRedisTemplate) {
+    public CacheClient(StringRedisTemplate stringRedisTemplate, RedissonClient redissonClient) {
         this.stringRedisTemplate = stringRedisTemplate;
+        this.redissonClient = redissonClient;
     }
 
     public void set(String key, Object value, Long time, TimeUnit unit) {
@@ -92,27 +95,23 @@ public class CacheClient {
             return r;
         }
         // 5.2.已过期，需要缓存重建
-        // 6.缓存重建
-        // 6.1.获取互斥锁
-        String lockKey = LOCK_SHOP_KEY + id;
-        boolean isLock = tryLock(lockKey);
-        // 6.2.判断是否获取锁成功
-        if (isLock){
-            // 6.3.成功，开启独立线程，实现缓存重建
-            CACHE_REBUILD_EXECUTOR.submit(() -> {
-                try {
-                    // 查询数据库
-                    R newR = dbFallback.apply(id);
-                    // 重建缓存
-                    this.setWithLogicalExpire(key, newR, time, unit);
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
-                }finally {
-                    // 释放锁
-                    unlock(lockKey);
-                }
-            });
-        }
+        // 6.缓存重建：在重建线程内加锁，保证锁的持有与释放为同一线程
+        // 6.1.抢不到互斥锁说明已有线程在重建，直接返回旧数据
+        RLock lock = redissonClient.getLock(LOCK_SHOP_KEY + id);
+        CACHE_REBUILD_EXECUTOR.submit(() -> {
+            if (!lock.tryLock()) {
+                return;
+            }
+            try {
+                // 查询数据库
+                R newR = dbFallback.apply(id);
+                // 重建缓存
+                this.setWithLogicalExpire(key, newR, time, unit);
+            } finally {
+                // 释放锁
+                lock.unlock();
+            }
+        });
         // 6.4.返回过期的商铺信息
         return r;
     }
@@ -135,10 +134,10 @@ public class CacheClient {
 
         // 4.实现缓存重建
         // 4.1.获取互斥锁
-        String lockKey = LOCK_SHOP_KEY + id;
+        RLock lock = redissonClient.getLock(LOCK_SHOP_KEY + id);
         R r = null;
         try {
-            boolean isLock = tryLock(lockKey);
+            boolean isLock = lock.tryLock();
             // 4.2.判断是否获取成功
             if (!isLock) {
                 // 4.3.获取锁失败，休眠并重试
@@ -159,19 +158,12 @@ public class CacheClient {
         } catch (InterruptedException e) {
             throw new RuntimeException(e);
         }finally {
-            // 7.释放锁
-            unlock(lockKey);
+            // 7.释放锁（仅当前线程持有时释放，避免 IllegalMonitorStateException）
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
         }
         // 8.返回
         return r;
-    }
-
-    private boolean tryLock(String key) {
-        Boolean flag = stringRedisTemplate.opsForValue().setIfAbsent(key, "1", 10, TimeUnit.SECONDS);
-        return BooleanUtil.isTrue(flag);
-    }
-
-    private void unlock(String key) {
-        stringRedisTemplate.delete(key);
     }
 }
