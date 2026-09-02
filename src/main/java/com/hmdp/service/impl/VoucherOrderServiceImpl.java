@@ -1,6 +1,7 @@
 package com.hmdp.service.impl;
 
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.baidu.fsg.uid.UidGenerator;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.VoucherOrder;
 import com.hmdp.mapper.VoucherOrderMapper;
@@ -8,7 +9,6 @@ import com.hmdp.mq.RocketMQProducer;
 import com.hmdp.mq.SeckillTxContext;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
-import com.hmdp.utils.RedisIdWorker;
 import com.hmdp.utils.SeckillMode;
 import com.hmdp.utils.UserHolder;
 import lombok.extern.slf4j.Slf4j;
@@ -48,7 +48,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private ISeckillVoucherService seckillVoucherService;
 
     @Resource
-    private RedisIdWorker redisIdWorker;
+    private UidGenerator uidGenerator;
     @Resource
     private RedissonClient redissonClient;
     @Resource
@@ -275,7 +275,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      */
     private Result seckillVoucherModeA(Long voucherId) {
         Long userId = UserHolder.getUser().getId();
-        long orderId = redisIdWorker.nextId("order");
+        long orderId = uidGenerator.getUID();
         VoucherOrder order = new VoucherOrder();
         order.setId(orderId);
         order.setUserId(userId);
@@ -312,7 +312,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      */
     private Result seckillVoucherModeB(Long voucherId) {
         Long userId = UserHolder.getUser().getId();
-        long orderId = redisIdWorker.nextId("order");
+        long orderId = uidGenerator.getUID();
         VoucherOrder order = new VoucherOrder();
         order.setId(orderId);
         order.setUserId(userId);

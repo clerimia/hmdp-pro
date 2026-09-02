@@ -1,12 +1,12 @@
 package com.hmdp.task;
 
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import com.baidu.fsg.uid.UidGenerator;
 import com.hmdp.entity.SeckillVoucher;
 import com.hmdp.entity.VoucherOrder;
 import com.hmdp.mq.RocketMQProducer;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
-import com.hmdp.utils.RedisIdWorker;
 import com.hmdp.utils.RedisConstants;
 import com.hmdp.utils.SeckillMode;
 
@@ -47,7 +47,7 @@ public class SeckillReconcileTask {
     @Resource
     private RocketMQProducer rocketMQProducer;
     @Resource
-    private RedisIdWorker redisIdWorker;
+    private UidGenerator uidGenerator;
 
     /** 超时关单阈值：与延迟消息档位一致（15 分钟） */
     private static final int ORDER_TIMEOUT_MINUTES = 15;
@@ -124,7 +124,7 @@ public class SeckillReconcileTask {
                     continue;
                 }
                 VoucherOrder order = new VoucherOrder();
-                order.setId(redisIdWorker.nextId("order"));
+                order.setId(uidGenerator.getUID());
                 order.setUserId(Long.valueOf(userId));
                 order.setVoucherId(voucherId);
                 // 补单场景：入口已扣 Redis（claim 已在集合中），消费者走方案 A 路径直接落库，不再 claim
