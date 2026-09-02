@@ -45,7 +45,9 @@
 ### 8. 多级缓存
 
 **问题：** 商铺详情多为 Redis → MySQL，热点仍反复打 Redis；更新后若只靠 TTL，脏读窗口偏长。  
-**做法：** 读路径为 **OpenResty 网关缓存 → Caffeine 本地缓存 → Redis（逻辑过期）→ MySQL**；网关命中则不再进入 Java。写库后删除 Caffeine 与 Redis，可选接入 **Canal** 订阅 binlog，经 MQ 通知应用驱逐缓存；网关层靠短 TTL / 主动失效策略与后端协同，缩短脏读窗口。
+**做法：** 读路径为 **Caffeine 本地缓存 → Redis（逻辑过期）→ MySQL**；逻辑过期命中旧值时先返回旧值，再由异步线程持 Redisson 锁重建，避免击穿。更新时同步删除 Caffeine 与 Redis，可选接入 **Canal** 订阅 binlog，经 MQ 通知应用驱逐缓存，把脏读窗口从「等 TTL」压到「MQ 投递延迟」级别。
+
+**为什么缓存不放在网关（OpenResty）：** 网关的 `lua_shared_dict` 收不到应用层的 binlog 驱逐通知，只能等 TTL 自然过期——等于在系统里放了第二份无法主动失效的真相；更糟的是它挡在 Java 之前，一旦脏了，前端怎么刷新都是旧值。因此网关职责收敛为**限流**（`src/main/resources/openresty/` 只保留令牌桶），缓存全部收回应用层，失效路径才闭环。
 
 ### 9. 读写链路分离
 
@@ -61,6 +63,6 @@
 注意容器内 3306 映射到宿主机 **3307**（本机 3306 通常已被 Windows MySQL 服务占用）；改了 SQL 想重跑需先 `docker compose down -v`。
 
 JDK 8 · MySQL · Redis · RocketMQ → 起依赖 + 导入上述 SQL → 填写 `application.yaml` 占位配置 → `seckill.mode=A`（默认）或 `B`（第二种写策略）。  
-网关示例配置：`src/main/resources/openresty/`。
+网关示例配置（仅网关令牌桶限流，不做业务缓存）：`src/main/resources/openresty/`。
 
 如果这个项目对你复习高并发或准备面试有帮助，欢迎点一颗 Star 支持一下。

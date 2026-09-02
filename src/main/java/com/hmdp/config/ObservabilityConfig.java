@@ -1,5 +1,10 @@
-package com.hmdp.observability;
+package com.hmdp.config;
 
+import com.hmdp.observability.MdcTaskDecorator;
+import com.hmdp.observability.TraceContext;
+import com.hmdp.observability.TraceIdFilter;
+import com.hmdp.observability.TraceIdGenerator;
+import com.hmdp.observability.UuidTraceIdGenerator;
 import org.springframework.beans.factory.InitializingBean;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
@@ -9,7 +14,6 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.core.Ordered;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
-import javax.annotation.Resource;
 import java.util.concurrent.ThreadPoolExecutor;
 
 /**
@@ -18,9 +22,12 @@ import java.util.concurrent.ThreadPoolExecutor;
  * <p>三个扩展点的接线都在这里，替换实现不用动业务代码：
  * <ol>
  *   <li>traceId 生成策略：注册自己的 {@link TraceIdGenerator} Bean 即可顶掉默认 UUID 实现</li>
- *   <li>跨进程载体：{@link MqTraceCarrier}（HTTP 侧是 {@link TraceIdFilter} 的 header）</li>
- *   <li>埋点后端：注册自己的 {@link ObservabilityRecorder} 实现（当前 Micrometer / NoOp 二选一）</li>
+ *   <li>跨进程载体：{@link com.hmdp.observability.MqTraceCarrier}（HTTP 侧是 {@link TraceIdFilter} 的 header）</li>
+ *   <li>埋点后端：注册自己的 {@link com.hmdp.observability.ObservabilityRecorder} 实现（当前 Micrometer / NoOp 二选一）</li>
  * </ol>
+ *
+ * <p>放在 {@code config} 包与项目其他 {@code @Configuration} 保持一致；
+ * {@code observability} 包本身只放能力类（上下文、埋点门面、边界适配器），不含装配。
  */
 @Configuration
 public class ObservabilityConfig {
@@ -44,7 +51,7 @@ public class ObservabilityConfig {
      * 把容器里的生成策略同步给 {@link TraceContext} 的静态持有者：
      * RocketMQ 内部线程、静态工具类等非 Spring 管理的调用方也能拿到同一策略。
      *
-     * <p>刻意做成独立 Bean 而不是在配置类里 {@code @Resource} 注入 —— 避免配置类自己依赖
+     * <p>刻意做成独立 Bean 而不是在配置类里注入字段 —— 避免配置类自己依赖
      * 自己声明的 Bean 造成自注入循环。
      */
     @Bean

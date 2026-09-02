@@ -40,7 +40,7 @@ public final class TraceContext {
             () -> UUID.randomUUID().toString().replace("-", "");
 
     /**
-     * 生成策略持有者。默认 UUID，由 {@code ObservabilityConfig} 注入 Spring 容器里的
+     * 生成策略持有者。默认 UUID，由 {@code com.hmdp.config.ObservabilityConfig} 注入 Spring 容器里的
      * {@link TraceIdGenerator} Bean 覆盖；非 Spring 管理的线程（RocketMQ 内部线程池等）
      * 走这条兜底路径，保证任何地方都能拿到一致策略。
      */

@@ -26,10 +26,15 @@ MDC 底层是 `ThreadLocal`，跨线程和跨进程都会断，所以每个边�
 
 | 边界 | 代码位置 | 载体 |
 | --- | --- | --- |
-| HTTP 入口 | `observability/TraceIdFilter`（FilterRegistrationBean，order = HIGHEST_PRECEDENCE） | 请求头 `X-Trace-Id` |
+| HTTP 入口 | `observability/TraceIdFilter`（注册见 `config/ObservabilityConfig`，order = HIGHEST_PRECEDENCE） | 请求头 `X-Trace-Id` |
 | 线程池 | `observability/MdcTaskDecorator` → `traceAwareExecutor` | MDC 快照（`submit()` 时刻捕获） |
 | MQ 发送 | `observability/MqTraceCarrier#inject`（3 个 send 方法） | 消息 `properties` |
 | MQ 消费 / 事务回查 | `mq/OrderMQConsumer`、`mq/SeckillTransactionListener#checkLocalTransaction` | 消息 `properties`（重试带 `-r{n}` 后缀） |
+
+**包结构约定**：`com.hmdp.observability` 只放能力类（上下文门面、埋点门面、边界适配器），
+不含 `@Configuration`；装配统一放 `com.hmdp.config.ObservabilityConfig`，与项目其他
+`CaffeineConfig` / `RedissonConfig` 等保持一致。业务侧注入线程池用
+`@Qualifier(ObservabilityConfig.TRACE_AWARE_EXECUTOR)`，不要自建线程池。
 
 两个关键约定：
 
@@ -77,7 +82,7 @@ Timer `hmdp.seckill.latency` → `hmdp_seckill_latency_seconds_*`。
 
 | 扩展点 | 现在 | 怎么换 |
 | --- | --- | --- |
-| ① traceId 生成策略 | `UuidTraceIdGenerator`（32 位无横线 UUID） | 注册自己的 `TraceIdGenerator` Bean，`ObservabilityConfig` 里挂了 `@ConditionalOnMissingBean` 会自动让位 |
+| ① traceId 生成策略 | `UuidTraceIdGenerator`（32 位无横线 UUID） | 注册自己的 `TraceIdGenerator` Bean，`config/ObservabilityConfig` 里挂了 `@ConditionalOnMissingBean` 会自动让位 |
 | ② 跨进程载体 | `MqTraceCarrier`（RocketMQ properties）/ Filter（HTTP header） | 换 Kafka、加 gRPC 时新增 carrier，`inject/extract` 签名不变，业务调用点不动 |
 | ③ 埋点后端 | `MicrometerRecorder`（Prometheus） | 实现 `ObservabilityRecorder` 接口（换 OTel 只改实现类）；压测时 `hmdp.observability.metrics.enabled=false` 自动切 `NoOpRecorder` |
 | ④ 事件集合 | `SeckillMetrics` / `CacheMetrics` | 加方法即可，指标名与合法 tag 值集中在这两个类里 |
@@ -117,3 +122,11 @@ hmdp_ratelimit_fallback_total{application="hmdp-pro",strategy="fail_open"} 3.0
   现改为放行并计 `hmdp_ratelimit_fallback_total{strategy="fail_open"}`。
   依据是本项目既定的 fail-open/fail-closed 哲学：限流是保护手段，业务层（库存、一人一单）仍然
   fail-closed。
+- **链路从 Java 入口开始，网关（OpenResty）不在链路内**：网关只做令牌桶限流，
+  请求头的 `X-Trace-Id` 由上游客户端/网关带来时会被复用，否则由 `TraceIdFilter` 生成。
+  代价是网关自身耗时不进入任何指标；要覆盖就在 OpenResty 侧生成 `X-Trace-Id` 并透传，
+  因为 Filter 本身就是「有就复用」，Java 代码一行都不用改。
+- **网关不再缓存业务数据，顺带消掉一段链路盲区**：此前商铺详情命中 `lua_shared_dict`
+  时直接在网关返回，请求根本不进 Java —— 既没有日志、没有 traceId，也无法被 Canal 驱逐
+  通知到，是彻底的观测黑洞兼一致性黑洞。现在读缓存全部收回 Java 多级缓存，
+  命中层级由 `hmdp.cache.hit{level}` 观测。
