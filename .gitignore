@@ -31,3 +31,9 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### WorkBuddy 项目数据（非源码，勿入库）###
+.workbuddy/
+
+### 本地技术笔记（个人整理，不进仓库）###
+tech/
