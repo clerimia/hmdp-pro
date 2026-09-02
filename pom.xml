@@ -104,6 +104,18 @@
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-registry-prometheus</artifactId>
         </dependency>
+        <!--容错：Resilience4J 1.7.x（2.x 要求 Java 17，本项目是 Java 8 + Boot 2.3.12）-->
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-spring-boot2</artifactId>
+            <version>1.7.1</version>
+        </dependency>
+        <!--R4J 的 @CircuitBreaker / @Bulkhead / @Retry 全部由 Aspect 实现，
+            缺这个 starter 注解会"静默失效"：不报错，也不生效。必须显式引入。-->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-aop</artifactId>
+        </dependency>
     </dependencies>
 
     <build>
