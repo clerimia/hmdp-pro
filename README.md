@@ -65,4 +65,7 @@
 JDK 8 · MySQL · Redis · RocketMQ → 起依赖 + 导入上述 SQL → 填写 `application.yaml` 占位配置 → `seckill.mode=A`（默认）或 `B`（第二种写策略）。  
 网关示例配置（仅网关令牌桶限流，不做业务缓存）：`src/main/resources/openresty/`。
 
+**可选观测栈**：`docker compose up -d prometheus grafana` → Prometheus :9090、Grafana :3000（admin/admin），
+秒杀面板自动导入；面板说明与 PromQL 速查见 `docs/observability.md` 第 7 节。
+
 如果这个项目对你复习高并发或准备面试有帮助，欢迎点一颗 Star 支持一下。

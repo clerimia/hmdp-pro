@@ -111,7 +111,43 @@ hmdp_seckill_latency_seconds_count{application="hmdp-pro",mode="A",result="succe
 hmdp_ratelimit_fallback_total{application="hmdp-pro",strategy="fail_open"} 3.0
 ```
 
-## 7. 已知取舍
+## 7. 本地采集栈（Prometheus + Grafana，可选）
+
+镜像与配置都在仓库里，两条命令起栈：
+
+```bash
+docker compose up -d prometheus grafana   # 只起观测栈；加 mysql redis 起全套
+docker compose down                        # 停（数据卷保留：prometheus-data / grafana-data）
+```
+
+| 入口 | 地址 | 说明 |
+| --- | --- | --- |
+| Prometheus | http://localhost:9090 | `/targets` 看抓取状态 |
+| Grafana | http://localhost:3000 | `admin` / `admin`，面板在 **hmdp-pro** 文件夹 |
+
+三个关键点：
+
+1. **Prometheus 抓的是宿主机上的应用**，不是容器内的 —— 配置里写的是
+   `host.docker.internal:8081`（靠 `extra_hosts: host-gateway` 解析）。
+   所以**应用要在宿主机先跑起来**；应用没起时 `/targets` 里显示 DOWN 是正常的，不是配置错了。
+2. **面板自动导入**，不用手点：Grafana 的 provisioning 会加载
+   `docker/grafana/provisioning/`（数据源）和 `docker/grafana/dashboards/hmdp-seckill.json`
+   （8 个面板：QPS、成功率、结果分布、耗时 P95、限流拦截/兜底、MQ 消费、缓存命中层级、重建结果）。
+3. **改了 `prometheus.yml` 不用重启容器**：
+   `curl -X POST http://localhost:9090/-/reload`（已开 `--web.enable-lifecycle`）。
+
+PromQL 速查：
+
+| 想看什么 | PromQL |
+| --- | --- |
+| 秒杀进入 QPS | `sum(rate(hmdp_seckill_request_total[1m])) by (mode)` |
+| 成功率 | `sum(rate(hmdp_seckill_result_total{result="success"}[1m])) / sum(rate(hmdp_seckill_result_total[1m]))` |
+| 失败原因分布 | `sum(rate(hmdp_seckill_result_total[1m])) by (reason)` |
+| 耗时 P95 | `histogram_quantile(0.95, sum(rate(hmdp_seckill_latency_seconds_bucket[1m])) by (le, mode))` |
+| 限流被拦截 / 兜底 | `sum(rate(hmdp_seckill_result_total{reason="rate_limited"}[1m]))` / `sum(rate(hmdp_ratelimit_fallback_total[1m])) by (strategy)` |
+| 缓存命中层级 | `sum(rate(hmdp_cache_hit_total[1m])) by (level)` |
+
+## 8. 已知取舍
 
 - **没有 span 树**：本方案只做 traceId 串联，没有父子 span 和耗时瀑布图。
   真上微服务就换 OpenTelemetry / SkyWalking（字节码增强自动埋点），

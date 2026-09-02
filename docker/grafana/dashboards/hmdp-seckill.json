@@ -1,0 +1,240 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "秒杀进入 QPS（按方案）",
+      "description": "限流之前计数，反映真实流量而不是被限流后的流量，两者相除即被限流比例",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+          "expr": "sum(rate(hmdp_seckill_request_total[1m])) by (mode)",
+          "legendFormat": "mode={{mode}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "秒杀成功率",
+      "description": "分母用 clamp_min 兜底，无流量时不会出现除零导致的断线",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+          "expr": "sum(rate(hmdp_seckill_result_total{result=\"success\"}[1m])) / clamp_min(sum(rate(hmdp_seckill_result_total[1m])), 0.0001)",
+          "legendFormat": "成功率",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "秒杀结果分布（按 reason）",
+      "description": "stock_out / repeat / mq_send_error / system_error / rate_limited；reason 取值封闭在 SeckillMetrics.Reason 枚举里",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+          "expr": "sum(rate(hmdp_seckill_result_total[1m])) by (reason)",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 40, "stacking": { "mode": "normal" }, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "秒杀耗时 P95（按方案）",
+      "description": "Timer 名不要手写 _seconds，Micrometer 会自动转换，否则暴露成 ..._seconds_seconds",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+          "expr": "histogram_quantile(0.95, sum(rate(hmdp_seckill_latency_seconds_bucket[1m])) by (le, mode))",
+          "legendFormat": "P95 mode={{mode}}",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+          "expr": "histogram_quantile(0.5, sum(rate(hmdp_seckill_latency_seconds_bucket[1m])) by (le, mode))",
+          "legendFormat": "P50 mode={{mode}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "right" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "限流：被拦截 vs 组件兜底（fail-open）",
+      "description": "fallback 上涨说明限流组件自身不可用，此时全量放行 —— 业务层（库存/一人一单）仍然 fail-closed",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+          "expr": "sum(rate(hmdp_seckill_result_total{reason=\"rate_limited\"}[1m]))",
+          "legendFormat": "被限流拦截",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+          "expr": "sum(rate(hmdp_ratelimit_fallback_total[1m])) by (strategy)",
+          "legendFormat": "兜底 strategy={{strategy}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "right" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "MQ 消费结果（按 tag / result）",
+      "description": "tag=CREATE（下单落库）/ TIMEOUT（超时关单）；error 持续上涨要查消费者",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+          "expr": "sum(rate(hmdp_order_consume_total[1m])) by (tag, result)",
+          "legendFormat": "{{tag}}/{{result}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "缓存命中层级分布",
+      "description": "l1=Caffeine / l2=Redis / db=回源；l1 占比下降通常意味着本地缓存被驱逐或实例刚重启",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+          "expr": "sum(rate(hmdp_cache_hit_total[1m])) by (level)",
+          "legendFormat": "{{level}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 40, "stacking": { "mode": "normal" }, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "缓存异步重建结果",
+      "description": "error 持续上涨 = 缓存长期刷不动，属于被线程池静默吞掉的静默故障，靠这个指标才能发现",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+          "expr": "sum(rate(hmdp_cache_rebuild_total[1m])) by (result)",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } }
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["hmdp", "seckill", "observability"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "hmdp-pro 秒杀可观测",
+  "uid": "hmdp-seckill",
+  "version": 1,
+  "weekStart": ""
+}
