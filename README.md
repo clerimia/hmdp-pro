@@ -56,7 +56,11 @@
 
 ## 运行
 
-JDK 8 · MySQL · Redis · RocketMQ → 导入 `src/main/resources/db/hmdp.sql` → 填写 `application.yaml` 占位配置 → `seckill.mode=A`（默认）或 `B`（第二种写策略）。  
+**一键起依赖（MySQL 8 / Redis）**：`docker compose up -d`，容器首次启动会自动按序导入 `src/main/resources/db/` 下的
+`hmdp-schema.sql`（建表）→ `hmdp-seed-data.sql`（种子数据）→ `worker_node.sql`（UidGenerator 节点表）。
+注意容器内 3306 映射到宿主机 **3307**（本机 3306 通常已被 Windows MySQL 服务占用）；改了 SQL 想重跑需先 `docker compose down -v`。
+
+JDK 8 · MySQL · Redis · RocketMQ → 起依赖 + 导入上述 SQL → 填写 `application.yaml` 占位配置 → `seckill.mode=A`（默认）或 `B`（第二种写策略）。  
 网关示例配置：`src/main/resources/openresty/`。
 
 如果这个项目对你复习高并发或准备面试有帮助，欢迎点一颗 Star 支持一下。

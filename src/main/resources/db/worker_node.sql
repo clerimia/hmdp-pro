@@ -13,4 +13,4 @@ CREATE TABLE worker_node (
   modified    TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间',
   created     TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   PRIMARY KEY (id)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8 COMMENT = 'UID Generator worker node 表';
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = 'UID Generator worker node 表';

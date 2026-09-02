@@ -34,6 +34,7 @@ seckill:
       enabled: true
       window-ms: 1000      # 窗口 1 秒
       max-requests: 5      # 同一用户窗口内最多 5 次秒杀请求
+
 # ===== 百度 UidGenerator（订单号生成，见 UidGeneratorConfig）=====
 # 位分配: sign(1) + time(28) + worker(22) + seq(13) = 63bit
 # 注意: epoch 2026-01-01 + 28bit 时间戳约可用 8.5 年，接近耗尽时调大 time-bits 或迁移 epoch
