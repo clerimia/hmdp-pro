@@ -2,6 +2,8 @@ package com.hmdp.mq;
 
 import cn.hutool.json.JSONUtil;
 import com.hmdp.entity.VoucherOrder;
+import com.hmdp.observability.MqTraceCarrier;
+import com.hmdp.observability.TraceContext;
 import com.hmdp.service.IVoucherOrderService;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.client.producer.LocalTransactionState;
@@ -46,6 +48,9 @@ public class SeckillTransactionListener implements TransactionListener {
 
     @Override
     public LocalTransactionState checkLocalTransaction(MessageExt msg) {
+        // 事务回查由 Broker 发起、跑在生产者内部的回查线程上，与发送线程不是同一个线程，
+        // 只能从消息 properties 还原 traceId（这里没有提交方上下文可继承）
+        TraceContext.open(MqTraceCarrier.extract(msg));
         try {
             VoucherOrder order = JSONUtil.toBean(
                     new String(msg.getBody(), StandardCharsets.UTF_8), VoucherOrder.class);
@@ -63,6 +68,8 @@ public class SeckillTransactionListener implements TransactionListener {
         } catch (Exception e) {
             log.error("事务回查异常，返回 UNKNOW 等待下次回查", e);
             return LocalTransactionState.UNKNOW;
+        } finally {
+            TraceContext.clear();
         }
     }
 }

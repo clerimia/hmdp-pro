@@ -45,6 +45,30 @@ uid:
   epoch-str: "2026-01-01"
   boost-power: 3           # RingBuffer 扩容倍数, bufferSize = 8192 << 3 = 65536
   schedule-interval: 60    # 定时补货周期(秒), 兜底防止缓冲区时间戳漂移
+# ===== 可观测性：traceId（MDC）+ Prometheus 指标 =====
+# 架构与事件表见 docs/observability.md
+hmdp:
+  observability:
+    trace:
+      enabled: true
+      # 上游透传用的请求头；跨服务（当前为 RocketMQ properties）统一用这个 key
+      header-name: X-Trace-Id
+    metrics:
+      # 压测时可置 false，埋点自动降级为 NoOpRecorder（业务零开销）
+      enabled: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: prometheus,health,info
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
 logging:
+  pattern:
+    console: "%d{HH:mm:ss.SSS} [%thread] [%X{traceId:-}] %-5level %logger{36} - %msg%n"
+    file: "%d{HH:mm:ss.SSS} [%thread] [%X{traceId:-}] %-5level %logger{36} - %msg%n"
   level:
     com.hmdp: info

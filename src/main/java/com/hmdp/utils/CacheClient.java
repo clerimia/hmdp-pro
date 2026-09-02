@@ -3,15 +3,17 @@ package com.hmdp.utils;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
+import com.hmdp.observability.CacheMetrics;
+import com.hmdp.observability.ObservabilityConfig;
 import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.core.task.AsyncTaskExecutor;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
@@ -25,11 +27,23 @@ public class CacheClient {
     private final StringRedisTemplate stringRedisTemplate;
     private final RedissonClient redissonClient;
 
-    private static final ExecutorService CACHE_REBUILD_EXECUTOR = Executors.newFixedThreadPool(10);
+    /**
+     * 重建线程池。用容器里的 {@code traceAwareExecutor} 而不是自建线程池：
+     * 它挂了 {@link com.hmdp.observability.MdcTaskDecorator}，
+     * 重建任务的日志才能带上发起请求的 traceId，否则异步重建这段在日志里是断的。
+     */
+    private final AsyncTaskExecutor rebuildExecutor;
 
-    public CacheClient(StringRedisTemplate stringRedisTemplate, RedissonClient redissonClient) {
+    private final CacheMetrics cacheMetrics;
+
+    public CacheClient(StringRedisTemplate stringRedisTemplate,
+                       RedissonClient redissonClient,
+                       @Qualifier(ObservabilityConfig.TRACE_AWARE_EXECUTOR) AsyncTaskExecutor rebuildExecutor,
+                       CacheMetrics cacheMetrics) {
         this.stringRedisTemplate = stringRedisTemplate;
         this.redissonClient = redissonClient;
+        this.rebuildExecutor = rebuildExecutor;
+        this.cacheMetrics = cacheMetrics;
     }
 
     public void set(String key, Object value, Long time, TimeUnit unit) {
@@ -98,7 +112,7 @@ public class CacheClient {
         // 6.缓存重建：在重建线程内加锁，保证锁的持有与释放为同一线程
         // 6.1.抢不到互斥锁说明已有线程在重建，直接返回旧数据
         RLock lock = redissonClient.getLock(LOCK_SHOP_KEY + id);
-        CACHE_REBUILD_EXECUTOR.submit(() -> {
+        rebuildExecutor.submit(() -> {
             if (!lock.tryLock()) {
                 return;
             }
@@ -107,6 +121,11 @@ public class CacheClient {
                 R newR = dbFallback.apply(id);
                 // 重建缓存
                 this.setWithLogicalExpire(key, newR, time, unit);
+                cacheMetrics.rebuilt(true);
+            } catch (Exception e) {
+                // 重建失败原本会被线程池静默吞掉，这里落一个 error 指标，便于配置告警
+                cacheMetrics.rebuilt(false);
+                log.error("缓存重建失败, key={}", key, e);
             } finally {
                 // 释放锁
                 lock.unlock();

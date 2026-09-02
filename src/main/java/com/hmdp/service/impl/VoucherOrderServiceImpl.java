@@ -7,6 +7,8 @@ import com.hmdp.entity.VoucherOrder;
 import com.hmdp.mapper.VoucherOrderMapper;
 import com.hmdp.mq.RocketMQProducer;
 import com.hmdp.mq.SeckillTxContext;
+import com.hmdp.observability.ObservabilityRecorder;
+import com.hmdp.observability.SeckillMetrics;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import com.hmdp.utils.SeckillMode;
@@ -55,6 +57,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private StringRedisTemplate stringRedisTemplate;
     @Resource
     private RocketMQProducer rocketMQProducer;
+    @Resource
+    private SeckillMetrics seckillMetrics;
 
     /** 秒杀方案：A=入口预扣+事务消息；B=限流入队+消费者校验 */
     @Value("${seckill.mode:A}")
@@ -274,65 +278,87 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      * 方案 A：事务消息 + 入口 Lua（库存/一人一单），同步返回成败
      */
     private Result seckillVoucherModeA(Long voucherId) {
-        Long userId = UserHolder.getUser().getId();
-        long orderId = uidGenerator.getUID();
-        VoucherOrder order = new VoucherOrder();
-        order.setId(orderId);
-        order.setUserId(userId);
-        order.setVoucherId(voucherId);
-        order.setSeckillMode(SeckillMode.A);
-
-        SeckillTxContext ctx = new SeckillTxContext(order);
+        // 埋点：计时 + 结果。reason 贯穿所有分支，finally 统一落定，
+        // 这样任何一个 return 路径都不会漏统计
+        ObservabilityRecorder.Sample sample = seckillMetrics.startSeckill();
+        SeckillMetrics.Reason reason = SeckillMetrics.Reason.SUCCESS;
         try {
-            SendResult sendResult = rocketMQProducer.sendOrderCreateInTransaction(order, ctx);
-            if (sendResult.getSendStatus() != SendStatus.SEND_OK) {
-                log.error("事务半消息发送失败, orderId={}, status={}", orderId, sendResult.getSendStatus());
+            Long userId = UserHolder.getUser().getId();
+            long orderId = uidGenerator.getUID();
+            VoucherOrder order = new VoucherOrder();
+            order.setId(orderId);
+            order.setUserId(userId);
+            order.setVoucherId(voucherId);
+            order.setSeckillMode(SeckillMode.A);
+
+            SeckillTxContext ctx = new SeckillTxContext(order);
+            try {
+                SendResult sendResult = rocketMQProducer.sendOrderCreateInTransaction(order, ctx);
+                if (sendResult.getSendStatus() != SendStatus.SEND_OK) {
+                    log.error("事务半消息发送失败, orderId={}, status={}", orderId, sendResult.getSendStatus());
+                    reason = SeckillMetrics.Reason.MQ_SEND_ERROR;
+                    return Result.fail("系统繁忙，请稍后重试");
+                }
+            } catch (Exception e) {
+                log.error("事务消息发送异常, userId={}, voucherId={}", userId, voucherId, e);
+                reason = SeckillMetrics.Reason.MQ_SEND_ERROR;
                 return Result.fail("系统繁忙，请稍后重试");
             }
-        } catch (Exception e) {
-            log.error("事务消息发送异常, userId={}, voucherId={}", userId, voucherId, e);
-            return Result.fail("系统繁忙，请稍后重试");
-        }
 
-        long r = ctx.getLuaResult();
-        if (r == 0) {
-            return Result.ok(orderId);
+            long r = ctx.getLuaResult();
+            if (r == 0) {
+                return Result.ok(orderId);
+            }
+            if (r == 1) {
+                reason = SeckillMetrics.Reason.STOCK_OUT;
+                return Result.fail("库存不足");
+            }
+            if (r == 2) {
+                reason = SeckillMetrics.Reason.REPEAT;
+                return Result.fail("不能重复下单");
+            }
+            reason = SeckillMetrics.Reason.SYSTEM_ERROR;
+            return Result.fail("系统繁忙，请稍后重试");
+        } finally {
+            seckillMetrics.finishSeckill(sample, SeckillMode.A, reason);
         }
-        if (r == 1) {
-            return Result.fail("库存不足");
-        }
-        if (r == 2) {
-            return Result.fail("不能重复下单");
-        }
-        return Result.fail("系统繁忙，请稍后重试");
     }
 
     /**
      * 方案 B：入口只发消息 + 写 WAITING，立即返回 orderId；限流在校验前由网关挡，校验在消费者
      */
     private Result seckillVoucherModeB(Long voucherId) {
-        Long userId = UserHolder.getUser().getId();
-        long orderId = uidGenerator.getUID();
-        VoucherOrder order = new VoucherOrder();
-        order.setId(orderId);
-        order.setUserId(userId);
-        order.setVoucherId(voucherId);
-        order.setSeckillMode(SeckillMode.B);
-
-        writeQueueStatus(orderId, SeckillMode.QUEUE_WAITING);
+        ObservabilityRecorder.Sample sample = seckillMetrics.startSeckill();
+        SeckillMetrics.Reason reason = SeckillMetrics.Reason.SUCCESS;
         try {
-            SendResult sendResult = rocketMQProducer.sendOrderCreate(order);
-            if (sendResult.getSendStatus() != SendStatus.SEND_OK) {
+            Long userId = UserHolder.getUser().getId();
+            long orderId = uidGenerator.getUID();
+            VoucherOrder order = new VoucherOrder();
+            order.setId(orderId);
+            order.setUserId(userId);
+            order.setVoucherId(voucherId);
+            order.setSeckillMode(SeckillMode.B);
+
+            writeQueueStatus(orderId, SeckillMode.QUEUE_WAITING);
+            try {
+                SendResult sendResult = rocketMQProducer.sendOrderCreate(order);
+                if (sendResult.getSendStatus() != SendStatus.SEND_OK) {
+                    writeQueueStatus(orderId, SeckillMode.QUEUE_FAIL_SYSTEM);
+                    reason = SeckillMetrics.Reason.MQ_SEND_ERROR;
+                    return Result.fail("系统繁忙，请稍后重试");
+                }
+            } catch (Exception e) {
+                log.error("方案B发消息失败, userId={}, voucherId={}", userId, voucherId, e);
                 writeQueueStatus(orderId, SeckillMode.QUEUE_FAIL_SYSTEM);
+                reason = SeckillMetrics.Reason.MQ_SEND_ERROR;
                 return Result.fail("系统繁忙，请稍后重试");
             }
-        } catch (Exception e) {
-            log.error("方案B发消息失败, userId={}, voucherId={}", userId, voucherId, e);
-            writeQueueStatus(orderId, SeckillMode.QUEUE_FAIL_SYSTEM);
-            return Result.fail("系统繁忙，请稍后重试");
+            // 方案 B 的「成功」指成功入队，真正的库存校验在消费者侧，
+            // 落库结果由 hmdp_order_consume_* 与 hmdp_seckill_result_*（消费侧补）反映
+            return Result.ok(orderId);
+        } finally {
+            seckillMetrics.finishSeckill(sample, SeckillMode.B, reason);
         }
-        // 返回 orderId：前端应轮询 /voucher-order/seckill/result/{orderId}
-        return Result.ok(orderId);
     }
 
     @Override

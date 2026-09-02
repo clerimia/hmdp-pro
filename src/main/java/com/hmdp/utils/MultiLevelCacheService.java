@@ -3,17 +3,19 @@ package com.hmdp.utils;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
 import com.github.benmanes.caffeine.cache.Cache;
+import com.hmdp.observability.CacheMetrics;
+import com.hmdp.observability.ObservabilityConfig;
 import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.core.task.AsyncTaskExecutor;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
 import javax.annotation.Resource;
 import java.time.LocalDateTime;
 import java.util.Random;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
@@ -42,8 +44,17 @@ public class MultiLevelCacheService {
     @Resource
     private Cache<String, Object> shopLocalCache;
 
-    /** 逻辑过期异步重建线程池 */
-    private static final ExecutorService REBUILD_EXECUTOR = Executors.newFixedThreadPool(10);
+    /**
+     * 逻辑过期异步重建线程池：统一用容器里的 {@code traceAwareExecutor}
+     * （挂了 {@link com.hmdp.observability.MdcTaskDecorator}），
+     * 否则重建任务的日志与发起请求的那条链路是断的。
+     */
+    @Resource
+    @Qualifier(ObservabilityConfig.TRACE_AWARE_EXECUTOR)
+    private AsyncTaskExecutor rebuildExecutor;
+
+    @Resource
+    private CacheMetrics cacheMetrics;
 
     /** 随机 TTL 因子，避免缓存雪崩 */
     private static final Random RANDOM = new Random();
@@ -70,6 +81,7 @@ public class MultiLevelCacheService {
         // ── 第一层：Caffeine 本地缓存 ──
         R local = (R) shopLocalCache.getIfPresent(cacheKey);
         if (local != null) {
+            cacheMetrics.hit(CacheMetrics.LEVEL_L1);
             log.debug("[多级缓存] L1 Caffeine 命中: {}", cacheKey);
             return local;
         }
@@ -82,6 +94,7 @@ public class MultiLevelCacheService {
             R data = JSONUtil.toBean((cn.hutool.json.JSONObject) redisData.getData(), type);
             LocalDateTime expireTime = redisData.getExpireTime();
 
+            cacheMetrics.hit(CacheMetrics.LEVEL_L2);
             if (expireTime.isAfter(LocalDateTime.now())) {
                 // 未过期 → 写回 Caffeine，返回
                 shopLocalCache.put(cacheKey, data);
@@ -89,7 +102,7 @@ public class MultiLevelCacheService {
                 return data;
             }
 
-            // 逻辑过期 → 异步重建
+            // 逻辑过期 → 异步重建（返回旧数据不阻塞请求）
             rebuildAsync(keyPrefix, id, dbFallback, ttl, unit);
             // 返回旧数据
             shopLocalCache.put(cacheKey, data);
@@ -102,6 +115,7 @@ public class MultiLevelCacheService {
         }
 
         // ── 第三层：查 MySQL（互斥锁防击穿）──
+        cacheMetrics.hit(CacheMetrics.LEVEL_DB);
         R result = queryWithMutexLock(keyPrefix, id, type, dbFallback, ttl, unit);
         if (result != null) {
             shopLocalCache.put(cacheKey, result);
@@ -179,7 +193,7 @@ public class MultiLevelCacheService {
             String keyPrefix, ID id, Function<ID, R> dbFallback, Long ttl, TimeUnit unit) {
 
         RLock lock = redissonClient.getLock(LOCK_SHOP_KEY + id);
-        REBUILD_EXECUTOR.submit(() -> {
+        rebuildExecutor.submit(() -> {
             // 在重建线程内加锁，保证锁的持有与释放为同一线程
             if (!lock.tryLock()) {
                 return; // 已经有别的线程在重建
@@ -189,6 +203,11 @@ public class MultiLevelCacheService {
                 if (data != null) {
                     writeWithLogicalExpire(keyPrefix + id, data, ttl, unit);
                 }
+                cacheMetrics.rebuilt(true);
+            } catch (Exception e) {
+                // 重建失败原本只会被线程池吞掉，落指标后才能配告警发现「缓存长期不刷新」
+                cacheMetrics.rebuilt(false);
+                log.error("[多级缓存] 异步重建失败: {}", keyPrefix + id, e);
             } finally {
                 lock.unlock();
             }

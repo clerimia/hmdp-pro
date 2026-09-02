@@ -2,6 +2,7 @@ package com.hmdp.mq;
 
 import cn.hutool.json.JSONUtil;
 import com.hmdp.entity.VoucherOrder;
+import com.hmdp.observability.MqTraceCarrier;
 import com.hmdp.utils.RocketMQConstants;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.client.exception.MQBrokerException;
@@ -71,6 +72,8 @@ public class RocketMQProducer {
                 RocketMQConstants.ORDER_TOPIC,
                 RocketMQConstants.ORDER_TAG_CREATE,
                 JSONUtil.toJsonStr(order).getBytes(StandardCharsets.UTF_8));
+        // 跨进程透传：traceId 随消息 properties 走到消费者（放 body 会污染业务契约）
+        MqTraceCarrier.inject(msg);
         SendResult result = producer.sendMessageInTransaction(msg, ctx);
         log.debug("订单事务消息发送结束, orderId={}, sendStatus={}, luaResult={}",
                 order.getId(), result.getSendStatus(), ctx.getLuaResult());
@@ -86,6 +89,7 @@ public class RocketMQProducer {
                 RocketMQConstants.ORDER_TOPIC,
                 RocketMQConstants.ORDER_TAG_CREATE,
                 JSONUtil.toJsonStr(order).getBytes(StandardCharsets.UTF_8));
+        MqTraceCarrier.inject(msg);
         SendResult result = producer.send(msg);
         log.debug("订单创建消息发送成功(方案B), orderId={}, msgId={}", order.getId(), result.getMsgId());
         return result;
@@ -101,6 +105,7 @@ public class RocketMQProducer {
                 RocketMQConstants.ORDER_TAG_TIMEOUT,
                 orderId.toString().getBytes(StandardCharsets.UTF_8));
         msg.setDelayTimeLevel(RocketMQConstants.ORDER_TIMEOUT_DELAY_LEVEL);
+        MqTraceCarrier.inject(msg);
         producer.send(msg);
         log.debug("超时关单延迟消息发送成功, orderId={}, delayLevel={}",
                 orderId, RocketMQConstants.ORDER_TIMEOUT_DELAY_LEVEL);
