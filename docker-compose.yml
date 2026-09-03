@@ -102,8 +102,55 @@ services:
       timeout: 5s
       retries: 30
 
+  # 版本与 pom.xml 里的 rocketmq-client 保持一致（4.9.7），
+  # 客户端与 Broker 跨大版本可能出现协议不兼容
+  rocketmq-namesrv:
+    image: apache/rocketmq:4.9.7
+    ports:
+      - "9876:9876"
+    environment:
+      # 默认 JVM 堆太大，开发机扛不住，显式压下来
+      JAVA_OPT_EXT: "-Xms512m -Xmx512m -Xmn256m"
+    command: sh mqnamesrv
+    volumes:
+      - rocketmq-namesrv-data:/home/rocketmq/logs
+    healthcheck:
+      test: ["CMD-SHELL", "sh -c 'echo > /dev/tcp/127.0.0.1/9876' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  rocketmq-broker:
+    image: apache/rocketmq:4.9.7
+    ports:
+      - "10909:10909"
+      - "10911:10911"
+      - "10912:10912"
+    environment:
+      NAMESRV_ADDR: rocketmq-namesrv:9876
+      JAVA_OPT_EXT: "-Xms1g -Xmx1g -Xmn512m"
+    # 用数组形式：字符串形式可能被整体当成单个参数（表现为无日志退出 253）
+    # brokerIP1 的取值见 docker/rocketmq/broker.conf 顶部注释
+    command: ["sh", "mqbroker", "-n", "rocketmq-namesrv:9876", "-c", "/home/rocketmq/conf/broker.conf"]
+    volumes:
+      - ./docker/rocketmq/broker.conf:/home/rocketmq/conf/broker.conf:ro
+    # store 必须用 tmpfs，不能挂数据卷：
+    # RocketMQ 用 mmap 读写 commitlog，Docker Desktop 的挂载卷（gRPC-FUSE）不支持，
+    # 表现为 broker 无日志退出 253 —— 排查了很久才定位到，别再改回数据卷。
+    # 代价是重启后消息丢失，本地开发无所谓。
+    tmpfs:
+      - /home/rocketmq/store
+    depends_on:
+      - rocketmq-namesrv
+    healthcheck:
+      test: ["CMD-SHELL", "sh -c 'echo > /dev/tcp/127.0.0.1/10911' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
 volumes:
   mysql-data:
   redis-data:
   prometheus-data:
   grafana-data:
+  rocketmq-namesrv-data:

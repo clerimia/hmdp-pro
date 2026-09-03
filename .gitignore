@@ -37,3 +37,6 @@ build/
 
 ### 本地技术笔记（个人整理，不进仓库）###
 tech/
+
+### 本地开发覆盖配置（含本机地址/账号，不进仓库）###
+src/main/resources/application-local*.yaml
