@@ -31,7 +31,14 @@ public class RefreshTokenInterceptor implements HandlerInterceptor {
         }
         // 2.基于TOKEN获取redis中的用户
         String key  = LOGIN_USER_KEY + token;
-        Map<Object, Object> userMap = stringRedisTemplate.opsForHash().entries(key);
+        Map<Object, Object> userMap;
+        try {
+            userMap = stringRedisTemplate.opsForHash().entries(key);
+        } catch (Exception e) {
+            // fail-open：Redis 不可用时只是"无法确认登录态"，不能让拦截器抛 500 把所有请求拖垮。
+            // 视为未登录放行，由 LoginInterceptor 统一给 401——这是故障期唯一的诚实语义
+            return true;
+        }
         // 3.判断用户是否存在
         if (userMap.isEmpty()) {
             return true;

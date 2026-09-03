@@ -10,6 +10,12 @@ import com.hmdp.service.IShopService;
 import com.hmdp.utils.CacheClient;
 import com.hmdp.utils.MultiLevelCacheService;
 import com.hmdp.utils.SystemConstants;
+import io.github.resilience4j.bulkhead.Bulkhead;
+import io.github.resilience4j.bulkhead.BulkheadFullException;
+import io.github.resilience4j.bulkhead.BulkheadRegistry;
+// 注解 @Bulkhead 与上面的核心类同名，这里用全限定名写在方法上（见 queryById）
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.geo.Distance;
 import org.springframework.data.geo.GeoResult;
 import org.springframework.data.geo.GeoResults;
@@ -33,6 +39,7 @@ import static com.hmdp.utils.RedisConstants.*;
  * @author 虎哥
  * @since 2021-12-22
  */
+@Slf4j
 @Service
 public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IShopService {
 
@@ -46,6 +53,22 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     @Resource
     private MultiLevelCacheService multiLevelCache;
 
+    /** 手动获取 dbFallbackBulkhead 许可用（fallback 不走 Spring 代理，注解失效） */
+    @Resource
+    private BulkheadRegistry bulkheadRegistry;
+
+    /**
+     * 查询入口（P1 容错）：
+     * <ul>
+     *   <li>{@code @Bulkhead(cacheBulkhead)}：信号量 50，许可耗尽立即拒，先在隔离层挡住</li>
+     *   <li>{@code @CircuitBreaker(redisBreaker)}：Redis 失败计入 redisBreaker，打开后快速失败</li>
+     * </ul>
+     * 降级 = 回源 DB。切到新链路的同时必须限流隔离（dbFallbackBulkhead，许可数对齐 Hikari 池 20），
+     * 否则 Redis 挂掉后所有读涌向 DB，降级本身就成了雪崩放大器。
+     */
+    @io.github.resilience4j.bulkhead.annotation.Bulkhead(name = "cacheBulkhead",
+            type = io.github.resilience4j.bulkhead.annotation.Bulkhead.Type.SEMAPHORE)
+    @CircuitBreaker(name = "redisBreaker", fallbackMethod = "queryByIdFallback")
     @Override
     public Result queryById(Long id) {
         // 多级缓存：Caffeine(L1 JVM) → Redis逻辑过期(L2) → MySQL(L3)
@@ -56,6 +79,37 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
             return Result.fail("店铺不存在！");
         }
         return Result.ok(shop);
+    }
+
+    /**
+     * redisBreaker 的降级：回源 DB。
+     *
+     * <p><b>为什么手动获取舱壁许可</b>：fallbackMethod 由 R4J 切面反射直调，
+     * 不经过 Spring 代理，方法上的任何注解都不会生效——所以 dbFallbackBulkhead
+     * 只能通过 {@link BulkheadRegistry} 手动 tryAcquirePermission（yaml 注释里同样的说明）。
+     *
+     * <p><b>舱壁拒绝不再回源</b>：cacheBulkhead 打回 ≠ Redis 故障。若降级也回源 DB，
+     * 高并发下一半流量被隔离层挡住后又会涌向 DB，隔离层形同虚设。
+     */
+    private Result queryByIdFallback(Long id, Throwable t) {
+        if (t instanceof BulkheadFullException) {
+            throw (BulkheadFullException) t;
+        }
+        log.warn("Redis 查询降级回源 DB, shopId={}, cause={}", id, t.toString());
+        Bulkhead bulkhead = bulkheadRegistry.bulkhead("dbFallbackBulkhead");
+        if (!bulkhead.tryAcquirePermission()) {
+            // 回源链路也满了：宁可再拒一个，也不让 DB 被打穿
+            throw BulkheadFullException.createBulkheadFullException(bulkhead);
+        }
+        try {
+            Shop shop = getById(id);
+            if (shop == null) {
+                return Result.fail("店铺不存在！");
+            }
+            return Result.ok(shop);
+        } finally {
+            bulkhead.releasePermission();
+        }
     }
 
     /**

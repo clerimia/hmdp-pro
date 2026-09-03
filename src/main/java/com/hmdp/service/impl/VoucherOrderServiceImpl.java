@@ -4,6 +4,8 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.baidu.fsg.uid.UidGenerator;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.VoucherOrder;
+import com.hmdp.exception.ErrorCode;
+import com.hmdp.exception.SystemException;
 import com.hmdp.mapper.VoucherOrderMapper;
 import com.hmdp.mq.RocketMQProducer;
 import com.hmdp.mq.SeckillTxContext;
@@ -13,6 +15,10 @@ import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import com.hmdp.utils.SeckillMode;
 import com.hmdp.utils.UserHolder;
+// 注意：注解 @Bulkhead 与核心类 io.github.resilience4j.bulkhead.Bulkhead 同名，
+// 同文件里只 import 注解，Type.SEMAPHORE 用全限定名引用（见下方注解）
+import io.github.resilience4j.bulkhead.annotation.Bulkhead;
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.client.producer.SendResult;
 import org.apache.rocketmq.client.producer.SendStatus;
@@ -72,6 +78,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
     /** Redis 开关：seckill:test:protection = FULL|HEIMA|EARLY（默认 FULL） */
     public static final String ONE_ORDER_PROTECTION_KEY = "seckill:test:protection";
+
+    /** 消费端一人一单锁租期（秒）：落库耗时上界，显式 lease 禁用 watchdog */
+    private static final long ORDER_LOCK_LEASE_SECONDS = 10;
 
     static {
         SECKILL_SCRIPT = new DefaultRedisScript<>();
@@ -161,7 +170,15 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         RLock redisLock = redissonClient.getLock("lock:order:" + userId);
         boolean locked = false;
         if (!early) {
-            locked = redisLock.tryLock();
+            // 显式 wait/lease：等 2s（并发的重复消息快速让位，而不是挂 30s），
+            // lease=10s 硬上限禁用 watchdog——消费线程挂死时锁最迟 10s 自动释放。
+            // 中断视为拿锁失败，走下面的失败分支（方案 B 抛错重试 / 方案 A 判重复）
+            try {
+                locked = redisLock.tryLock(2, ORDER_LOCK_LEASE_SECONDS, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                locked = false;
+            }
             if (!locked) {
                 if (modeB) {
                     throw new RuntimeException("获取下单锁失败，等待重试, orderId=" + orderId);
@@ -239,7 +256,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             log.error("MQ 异步落库失败，等待重试, orderId={}", orderId, e);
             throw new RuntimeException(e);
         } finally {
-            if (locked) {
+            // 租期内未完成时锁已自动过期，此处再 unlock 会抛 IllegalMonitorStateException
+            if (locked && redisLock.isHeldByCurrentThread()) {
                 redisLock.unlock();
             }
         }
@@ -266,6 +284,21 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         return Boolean.TRUE.equals(exists);
     }
 
+    /**
+     * 秒杀入口（P1 容错）：
+     * <ul>
+     *   <li>{@code @Bulkhead(seckillBulkhead)}：信号量 100（Tomcat 200 线程的一半），
+     *       maxWait=0 许可耗尽立即拒——排队只会让延迟不可控，不如快速失败。</li>
+     *   <li>{@code @CircuitBreaker(redisBreaker)}：Redis 故障计入 redisBreaker，
+     *       熔断打开后新请求不再触碰 Redis，直接 503「活动火爆，请稍后」。</li>
+     * </ul>
+     * 降级语义 = <b>fail-closed</b>：无论哪个层拒绝（舱壁满 / 熔断打开 / Redis 不可用），
+     * 都只能拒绝下单，绝不能放行——Mode A 的不超卖证明唯一依赖 Redis Lua 的原子扣减，
+     * Redis 挂了还放行 = 拆掉正确性屏障，直接超卖。
+     * 两个异常（舱壁满 / 熔断打开）由全局异常处理器统一转成 503 + SYS_BUSY。
+     */
+    @Bulkhead(name = "seckillBulkhead", type = Bulkhead.Type.SEMAPHORE)
+    @CircuitBreaker(name = "redisBreaker")
     @Override
     public Result seckillVoucher(Long voucherId) {
         if (SeckillMode.B.equalsIgnoreCase(seckillMode)) {
@@ -317,8 +350,12 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 reason = SeckillMetrics.Reason.REPEAT;
                 return Result.fail("不能重复下单");
             }
+            // r == -1：事务监听器捕获了本地事务（Lua）的异常后置 UNKNOW 并把结果标成 -1。
+            // 这里必须以 SystemException 上抛而不是返回 Result.fail：
+            //   1. Result.fail 是"正常返回"，redisBreaker 一个失败都记不到，永远学不会熔断；
+            //   2. SystemException 由全局处理器转成 503「缓存服务暂时不可用」= 语义化快速失败。
             reason = SeckillMetrics.Reason.SYSTEM_ERROR;
-            return Result.fail("系统繁忙，请稍后重试");
+            throw new SystemException(ErrorCode.SYS_REDIS_UNAVAILABLE, "秒杀库存扣减暂不可用");
         } finally {
             seckillMetrics.finishSeckill(sample, SeckillMode.A, reason);
         }
@@ -339,7 +376,14 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             order.setVoucherId(voucherId);
             order.setSeckillMode(SeckillMode.B);
 
-            writeQueueStatus(orderId, SeckillMode.QUEUE_WAITING);
+            // Redis 不可用时这一步就会抛——上抛 SystemException 让 redisBreaker 记到这次失败，
+            // 吞掉返回 Result 会让熔断器在 Redis 挂掉时依然显示"健康"
+            try {
+                writeQueueStatus(orderId, SeckillMode.QUEUE_WAITING);
+            } catch (Exception e) {
+                reason = SeckillMetrics.Reason.SYSTEM_ERROR;
+                throw new SystemException(ErrorCode.SYS_REDIS_UNAVAILABLE, "排队状态写入失败");
+            }
             try {
                 SendResult sendResult = rocketMQProducer.sendOrderCreate(order);
                 if (sendResult.getSendStatus() != SendStatus.SEND_OK) {

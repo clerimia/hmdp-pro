@@ -8,10 +8,21 @@ spring:
     url: jdbc:mysql://127.0.0.1:3306/hmdp?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true
     username: your_mysql_user
     password: your_mysql_password
+    hikari:
+      # 拿连接最多等 3s，超时抛 SQLTransientConnectionException（会冒泡成 503，计入 dbBreaker）
+      # 默认 30s：DB 抖动时 Tomcat 线程会全部卡在等连接上，比 DB 本身故障更致命
+      connection-timeout: 3000
+      # 连接池上限。池子越大 ≠ 吞吐越高：MySQL 侧并发线程切换成本会反噬。
+      # 取 20 = 秒杀入口信号量(100) 的 1/5，保证非秒杀查询仍有连接可用
+      maximum-pool-size: 20
   redis:
     host: your_redis_host
     port: 6379
     # password: your_redis_password
+    # 【本次改造最关键的一项】Lettuce 默认是 60s 命令超时。
+    # Redis 挂掉时每个请求卡 60s → Tomcat 线程池几分钟内被占光 → 雪崩殃及 MySQL。
+    # 收敛到 800ms：单个请求最坏只浪费 800ms，失败快速上抛，交给熔断/降级处理。
+    timeout: 800ms
     lettuce:
       pool:
         max-active: 10
@@ -56,6 +67,60 @@ hmdp:
     metrics:
       # 压测时可置 false，埋点自动降级为 NoOpRecorder（业务零开销）
       enabled: true
+
+# ===== Resilience4J 容错（设计见 docs/plans/2026-09-03-resilience4j-design.md）=====
+# 切面顺序（数字小的在外层）：Retry → CircuitBreaker → RateLimiter → TimeLimiter → Bulkhead
+# 推论：一次请求内的 N 次重试会被熔断器记为 N 次调用，调 failureRateThreshold 时要算进去。
+resilience4j:
+  circuitbreaker:
+    instances:
+      # 只管 Redis 一个依赖。按依赖拆分而不是全局共用：
+      # Redis 抖动不应熔断 MQ 通道，否则爆炸半径反而变大。
+      redisBreaker:
+        failure-rate-threshold: 50          # 失败率阈值（百分比）
+        sliding-window-type: COUNT_BASED    # 按调用次数统计，不看时间分布
+        sliding-window-size: 20             # 最近 20 次调用为统计样本
+        # 低于该调用数时不计算失败率：秒杀冷启动时样本太少，
+        # 前两次失败就 100% 会直接熔断，这是 COUNT_BASED 窗口的经典坑
+        minimum-number-of-calls: 10
+        wait-duration-in-open-state: 10s    # 打开状态持续 10s 后进半开
+        automatic-transition-from-open-to-half-open-enabled: true  # 自动进半开，不等下一次调用触发
+        # 半开状态下允许的试探调用数：默认 10 太多，一次故障期可能全军覆没才判定
+        permitted-number-of-calls-in-half-open-state: 3
+        # 业务异常不计入失败率。库存不足/重复下单是秒杀高峰期最高频的结果，
+        # 算进失败率会把健康的依赖误熔断（这是 P0 先建异常体系的原因）
+        ignore-exceptions:
+          - com.hmdp.exception.BusinessException
+          # 舱壁拒绝 ≠ 依赖故障：隔离层打回的请求不该污染失败率，
+          # 否则高峰期限流打满反而会把健康的 redisBreaker 打开
+          - io.github.resilience4j.bulkhead.BulkheadFullException
+  bulkhead:
+    instances:
+      # 秒杀入口：信号量而非线程池（详见设计文档第 6 节）
+      # 关键：信号量只能拒绝新请求，救不了已卡住的线程 —— 所以 Redis 800ms 超时是它的前置条件
+      seckillBulkhead:
+        max-concurrent-calls: 100   # Tomcat 默认 200 线程，秒杀最多占用一半，给查询接口留容量
+        max-wait-duration: 0        # 许可耗尽立即拒，排队只会让延迟不可控
+      # 缓存查询入口：同理，同步接口用信号量
+      cacheBulkhead:
+        max-concurrent-calls: 50
+        max-wait-duration: 0
+      # 回源 DB 的闸门：Redis 挂了之后所有读都涌向 DB，不限流的话降级本身就是雪崩放大器。
+      # 许可数对齐 Hikari 池（20），保证每个拿到许可的请求都真能拿到连接。
+      # 注意：这个实例不是用注解挂在方法上的 —— fallback 方法是 R4J 反射直调、不走 Spring 代理，
+      # 注解会失效，所以在代码里用 BulkheadRegistry 手动 tryAcquirePermission。
+      dbFallbackBulkhead:
+        max-concurrent-calls: 20
+        max-wait-duration: 0
+  retry:
+    instances:
+      # 只配在只读幂等路径（缓存查询）。写路径一律不加重试：
+      # 下单重试可能重复扣库存，且 MQ 侧已有 client 重试 + 事务回查 + 对账补单三层兜底。
+      cacheQueryRetry:
+        max-attempts: 2                  # 总共尝试 2 次（首次 + 1 次重试）
+        wait-duration: 100ms             # 首次退避 100ms
+        enable-exponential-backoff: true # 指数退避，避免抖动期重试扎堆
+        exponential-backoff-multiplier: 2
 
 management:
   endpoints:

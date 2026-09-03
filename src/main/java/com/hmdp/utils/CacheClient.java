@@ -36,6 +36,11 @@ public class CacheClient {
 
     private final CacheMetrics cacheMetrics;
 
+    /** 缓存重建互斥锁租期（秒）：显式 lease 禁用 watchdog，线程挂死时锁最迟 30s 自动释放 */
+    private static final long REBUILD_LOCK_LEASE_SECONDS = 30;
+    /** 缓存击穿互斥锁租期（秒）：DB 回源 + 写缓存的上界 */
+    private static final long MUTEX_LOCK_LEASE_SECONDS = 30;
+
     public CacheClient(StringRedisTemplate stringRedisTemplate,
                        RedissonClient redissonClient,
                        @Qualifier(ObservabilityConfig.TRACE_AWARE_EXECUTOR) AsyncTaskExecutor rebuildExecutor,
@@ -111,9 +116,18 @@ public class CacheClient {
         // 5.2.已过期，需要缓存重建
         // 6.缓存重建：在重建线程内加锁，保证锁的持有与释放为同一线程
         // 6.1.抢不到互斥锁说明已有线程在重建，直接返回旧数据
+        // 显式 wait/lease：wait=0（抢不到立即让位）、lease=30s 硬上限。
+        // 无参 tryLock 会启用 watchdog 无限续期——重建线程挂死时锁永远不释放
         RLock lock = redissonClient.getLock(LOCK_SHOP_KEY + id);
         rebuildExecutor.submit(() -> {
-            if (!lock.tryLock()) {
+            boolean locked;
+            try {
+                locked = lock.tryLock(0, REBUILD_LOCK_LEASE_SECONDS, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            if (!locked) {
                 return;
             }
             try {
@@ -127,8 +141,10 @@ public class CacheClient {
                 cacheMetrics.rebuilt(false);
                 log.error("缓存重建失败, key={}", key, e);
             } finally {
-                // 释放锁
-                lock.unlock();
+                // 租期内未完成时锁已自动过期，此处再 unlock 会抛 IllegalMonitorStateException
+                if (lock.isHeldByCurrentThread()) {
+                    lock.unlock();
+                }
             }
         });
         // 6.4.返回过期的商铺信息
@@ -156,7 +172,8 @@ public class CacheClient {
         RLock lock = redissonClient.getLock(LOCK_SHOP_KEY + id);
         R r = null;
         try {
-            boolean isLock = lock.tryLock();
+            // 显式 wait/lease：wait=0（拿不到走下面的休眠重试）、lease=30s 硬上限（不含 watchdog）
+            boolean isLock = lock.tryLock(0, MUTEX_LOCK_LEASE_SECONDS, TimeUnit.SECONDS);
             // 4.2.判断是否获取成功
             if (!isLock) {
                 // 4.3.获取锁失败，休眠并重试

@@ -23,6 +23,7 @@ import javax.annotation.Resource;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
@@ -53,6 +54,8 @@ public class SeckillReconcileTask {
     private static final int ORDER_TIMEOUT_MINUTES = 15;
     /** 秒杀结束多久后允许重算库存（等待消费队列排空） */
     private static final int RECONCILE_AFTER_END_MINUTES = 2;
+    /** 对账分布式锁租期（秒）：小于调度间隔 60s，实例宕机后锁快速自动释放 */
+    private static final long RECONCILE_LOCK_LEASE_SECONDS = 50;
 
     /**
      * 每分钟执行：关单兜底 → 补单 → 库存重算。
@@ -61,7 +64,17 @@ public class SeckillReconcileTask {
     @Scheduled(fixedDelay = 60_000)
     public void reconcile() {
         RLock lock = redissonClient.getLock("lock:seckill:reconcile");
-        if (!lock.tryLock()) {
+        // 显式 wait/lease：wait=0（其他实例在对账就立即放弃，本轮职责下轮再担）；
+        // lease=50s 小于调度间隔 60s——实例中途宕机时锁最迟 50s 自动释放，避免 watchdog 无限续期。
+        // 超租期的极端情况由任务幂等性兜底：两实例并发对账也不产生副作用
+        boolean locked;
+        try {
+            locked = lock.tryLock(0, RECONCILE_LOCK_LEASE_SECONDS, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return;
+        }
+        if (!locked) {
             return; // 其他实例正在对账
         }
         try {
@@ -71,7 +84,10 @@ public class SeckillReconcileTask {
         } catch (Exception e) {
             log.error("秒杀对账任务执行异常", e);
         } finally {
-            lock.unlock();
+            // 租期内未跑完时锁已自动过期，此处再 unlock 会抛 IllegalMonitorStateException
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
         }
     }
 

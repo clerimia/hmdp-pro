@@ -110,6 +110,14 @@
             <artifactId>resilience4j-spring-boot2</artifactId>
             <version>1.7.1</version>
         </dependency>
+        <!--R4J 指标桥：把熔断/舱壁/重试状态注册进 Micrometer，
+            /actuator/prometheus 才能看到 resilience4j_circuitbreaker_state 等序列（P1 验收项）。
+            spring-boot2 starter 本身不带它，必须显式引入。-->
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-micrometer</artifactId>
+            <version>1.7.1</version>
+        </dependency>
         <!--R4J 的 @CircuitBreaker / @Bulkhead / @Retry 全部由 Aspect 实现，
             缺这个 starter 注解会"静默失效"：不报错，也不生效。必须显式引入。-->
         <dependency>
