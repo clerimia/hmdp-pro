@@ -53,7 +53,13 @@ services:
       - "6379:6379"
     volumes:
       - redis-data:/data
-    command: redis-server --appendonly yes
+    # maxmemory-policy 说明：
+    #   默认 noeviction 在内存打满后直接拒绝写（登录/秒杀全挂），必须显式配。
+    #   本实例以缓存为主（商铺缓存 / 空值标记都带 TTL），选 allkeys-lru：
+    #   内存压力下优先驱逐最久未访问的 key，缓存被逐最多回源 DB，语义无损。
+    #   注意：秒杀库存等 key 也可能被逐，本地开发可接受；生产若把
+    #   「不可丢」数据放缓存实例，应拆实例并配 noeviction + 合理 maxmemory。
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

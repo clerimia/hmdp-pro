@@ -169,7 +169,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
     /**
      * 提交后删除缓存：瞬时抖动靠短退避重试自愈；仍失败只记日志告警、绝不抛出——
-     * 此时 DB 已提交，一致性由 Canal binlog 二次删除（待部署）与物理 TTL 保险丝兜底收敛，
+     * 此时 DB 已提交，一致性由物理 TTL 保险丝兜底收敛，
      * 最迟 3 倍逻辑 TTL（cache:shop 为 90min）内自愈。
      */
     private void evictCacheWithRetry(String keyPrefix, Long id, int maxRetries) {
@@ -179,7 +179,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
                 return;
             } catch (Exception e) {
                 if (i >= maxRetries) {
-                    log.error("缓存删除失败，等待 Canal/TTL 兜底, key={}, retries={}",
+                    log.error("缓存删除失败，等待物理 TTL 兜底, key={}, retries={}",
                             keyPrefix + id, maxRetries, e);
                     return;
                 }
