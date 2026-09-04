@@ -25,6 +25,8 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.domain.geo.GeoReference;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import javax.annotation.Resource;
 import java.util.*;
@@ -148,9 +150,48 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         }
         // 1.更新数据库
         updateById(shop);
-        // 2.删除多级缓存（Caffeine + Redis）
-        multiLevelCache.evict(CACHE_SHOP_KEY, id);
+        // 2.事务提交后再失效多级缓存（Caffeine + Redis）：
+        //   - 缓存组件故障不应阻断业务主流程（此前写在事务内，Redis 故障会连带业务回滚）；
+        //   - 事务回滚时也不会留下「缓存已删 + 库里还是旧值」的错位。
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    evictCacheWithRetry(CACHE_SHOP_KEY, id, 2);
+                }
+            });
+        } else {
+            // 防御：无事务上下文时直接同步删，不因环境变化悄悄失效
+            evictCacheWithRetry(CACHE_SHOP_KEY, id, 2);
+        }
         return Result.ok();
+    }
+
+    /**
+     * 提交后删除缓存：瞬时抖动靠短退避重试自愈；仍失败只记日志告警、绝不抛出——
+     * 此时 DB 已提交，一致性由 Canal binlog 二次删除（待部署）与物理 TTL 保险丝兜底收敛，
+     * 最迟 3 倍逻辑 TTL（cache:shop 为 90min）内自愈。
+     */
+    private void evictCacheWithRetry(String keyPrefix, Long id, int maxRetries) {
+        for (int i = 0; ; i++) {
+            try {
+                multiLevelCache.evict(keyPrefix, id);
+                return;
+            } catch (Exception e) {
+                if (i >= maxRetries) {
+                    log.error("缓存删除失败，等待 Canal/TTL 兜底, key={}, retries={}",
+                            keyPrefix + id, maxRetries, e);
+                    return;
+                }
+                try {
+                    Thread.sleep(100L << i);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    log.error("缓存删除重试被中断, key={}", keyPrefix + id, ie);
+                    return;
+                }
+            }
+        }
     }
 
     @Override

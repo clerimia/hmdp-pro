@@ -291,6 +291,10 @@ public class MultiLevelCacheService {
         long baseSec = unit.toSeconds(ttl);
         long jitter = (long) (baseSec * 0.2 * RANDOM.nextDouble());
         redisData.setExpireTime(LocalDateTime.now().plusSeconds(baseSec + jitter));
-        stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(redisData));
+        // 物理 TTL 保险丝：不参与正常过期判断（那是 expireTime 的职责）。逻辑过期把过期判断
+        // 挪进了应用层，Redis 侧这个 key 本身永不过期；一旦主动删除与异步重建同时失败，
+        // 脏数据将无限期驻留。这里保证最迟 3 倍逻辑 TTL 内自愈，把 ∞ 变成有限值。
+        stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(redisData),
+                baseSec * 3, TimeUnit.SECONDS);
     }
 }

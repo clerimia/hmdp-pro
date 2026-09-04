@@ -14,13 +14,17 @@ import java.util.concurrent.TimeUnit;
 public class CaffeineConfig {
 
     /**
-     * 商铺本地缓存：最大 10000 条，写入后 10 分钟过期
+     * 商铺本地缓存：最大 10000 条，写入后 30 秒过期
+     *
+     * <p>TTL 取短是有意的：本地缓存无法跨实例主动失效（Canal CLUSTERING 消费
+     * 只会命中随机一个实例），跨实例脏数据只能靠 TTL 自愈——30s 把多实例
+     * 一致性窗口从 10min 压到 30s，代价是命中率下降、Redis 读 QPS 上升。
      */
     @Bean
     public Cache<String, Object> shopLocalCache() {
         return Caffeine.newBuilder()
                 .maximumSize(10_000)
-                .expireAfterWrite(10, TimeUnit.MINUTES)
+                .expireAfterWrite(30, TimeUnit.SECONDS)
                 .recordStats()
                 .build();
     }
