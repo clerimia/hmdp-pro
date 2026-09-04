@@ -63,6 +63,11 @@ Timer `hmdp.seckill.latency` → `hmdp_seckill_latency_seconds_*`。
 | `hmdp.order.dead_letter` | Counter | — | 订单消息超重试上限落入死信 topic（等待对账/人工介入） |
 | `hmdp.cache.rebuild` | Counter | `result` | 缓存异步重建结果 |
 | `hmdp.cache.hit` | Counter | `level`(l1/l2/db) | 多级缓存命中层级分布 |
+| `hmdp.seckill.degraded` | Counter | `breaker` `reason` | 秒杀降级量（dbBreaker 打开 → `db_degraded`；mqBreaker 打开 → `mq_send_error`），与 result 的 reason 同口径 |
+| `hmdp.resilience.breaker.event` | Counter | `breaker` `kind` | R4J 事件订阅（`observability/ResilienceMetrics`）：`error`=学习期依赖失败，`not_permitted`=熔断打开后快速打回 |
+| `hmdp.resilience.breaker.transition` | Counter | `breaker` `state`(closed/open/half_open) | 熔断状态翻转时刻（状态存续看 `resilience4j_circuitbreaker_state` Gauge） |
+| `hmdp.resilience.retry` | Counter | `retry` `kind` | R4J Retry 事件：`retry`=重试触发，`error`=重试耗尽最终失败 |
+| `hmdp.resilience.fallback` | Counter | `breaker` `kind` | fallbackMethod 手动打点：`not_permitted`/`error`=降级执行，`bulkhead_rejected`=舱壁打回、降级未执行 |
 
 `reason` 取值封闭在 `SeckillMetrics.Reason` 枚举里：
 `success` / `stock_out` / `repeat` / `rate_limited` / `mq_send_error` / `db_degraded` / `system_error`。
@@ -88,7 +93,7 @@ Timer `hmdp.seckill.latency` → `hmdp_seckill_latency_seconds_*`。
 | ① traceId 生成策略 | `UuidTraceIdGenerator`（32 位无横线 UUID） | 注册自己的 `TraceIdGenerator` Bean，`config/ObservabilityConfig` 里挂了 `@ConditionalOnMissingBean` 会自动让位 |
 | ② 跨进程载体 | `MqTraceCarrier`（RocketMQ properties）/ Filter（HTTP header） | 换 Kafka、加 gRPC 时新增 carrier，`inject/extract` 签名不变，业务调用点不动 |
 | ③ 埋点后端 | `MicrometerRecorder`（Prometheus） | 实现 `ObservabilityRecorder` 接口（换 OTel 只改实现类）；压测时 `hmdp.observability.metrics.enabled=false` 自动切 `NoOpRecorder` |
-| ④ 事件集合 | `SeckillMetrics` / `CacheMetrics` | 加方法即可，指标名与合法 tag 值集中在这两个类里 |
+| ④ 事件集合 | `SeckillMetrics` / `CacheMetrics` / `ResilienceMetrics` | 加方法即可，指标名与合法 tag 值集中在这些类里 |
 
 业务代码只依赖 `ObservabilityRecorder` 和语义化的 `SeckillMetrics` / `CacheMetrics`，
 换任何一层实现都不用改调用点。
@@ -135,7 +140,8 @@ docker compose down                        # 停（数据卷保留：prometheus-
    所以**应用要在宿主机先跑起来**；应用没起时 `/targets` 里显示 DOWN 是正常的，不是配置错了。
 2. **面板自动导入**，不用手点：Grafana 的 provisioning 会加载
    `docker/grafana/provisioning/`（数据源）和 `docker/grafana/dashboards/hmdp-seckill.json`
-   （8 个面板：QPS、成功率、结果分布、耗时 P95、限流拦截/兜底、MQ 消费、缓存命中层级、重建结果）。
+   （13 个面板：QPS、成功率、结果分布、耗时 P95、限流拦截/兜底、MQ 消费、缓存命中层级、重建结果，
+   以及 P3 新增的「熔断与降级」5 块：熔断状态、熔断事件、状态翻转、降级与重试、秒杀降级量）。
 3. **改了 `prometheus.yml` 不用重启容器**：
    `curl -X POST http://localhost:9090/-/reload`（已开 `--web.enable-lifecycle`）。
 
@@ -149,6 +155,9 @@ PromQL 速查：
 | 耗时 P95 | `histogram_quantile(0.95, sum(rate(hmdp_seckill_latency_seconds_bucket[1m])) by (le, mode))` |
 | 限流被拦截 / 兜底 | `sum(rate(hmdp_seckill_result_total{reason="rate_limited"}[1m]))` / `sum(rate(hmdp_ratelimit_fallback_total[1m])) by (strategy)` |
 | 缓存命中层级 | `sum(rate(hmdp_cache_hit_total[1m])) by (level)` |
+| 熔断是否打开 | `max by (name, state) (resilience4j_circuitbreaker_state{state=~"open\|half_open"})` |
+| 每分钟降级拒流量 | `sum(increase(hmdp_resilience_breaker_event_total{kind="not_permitted"}[1m])) by (breaker)` |
+| 每分钟秒杀降级量 | `sum(increase(hmdp_seckill_degraded_total[1m])) by (breaker, reason)` |
 
 ## 8. 已知取舍
 
@@ -169,3 +178,100 @@ PromQL 速查：
   时直接在网关返回，请求根本不进 Java —— 既没有日志、没有 traceId，也无法被 Canal 驱逐
   通知到，是彻底的观测黑洞兼一致性黑洞。现在读缓存全部收回 Java 多级缓存，
   命中层级由 `hmdp.cache.hit{level}` 观测。
+
+## 9. 附录：熔断与降级故障演练（P3 验收）
+
+> 目的：用真实故障验证「降级可观测」——第三方照着本节做，应能得到同样的结论。
+> 全程只需要两个终端，不需要造压测数据。
+
+### 9.0 准备
+
+```bash
+# 1. 起依赖（mysql / redis / rocketmq）
+docker compose up -d
+
+# 2. 起应用（宿主机，8081 端口）
+mvn.cmd spring-boot:run
+
+# 3. 起观测栈（可选，不开也可以直接看 /actuator/prometheus）
+docker compose up -d prometheus grafana   # Grafana: http://localhost:3000，面板「熔断与降级」
+
+# 4. 基线确认：此刻三个熔断器都应是 closed，无降级计数
+curl -s localhost:8081/actuator/prometheus | grep -E "resilience4j_circuitbreaker_state|hmdp_resilience"
+```
+
+### 9.1 演练一：Redis 挂（redisBreaker）
+
+**分步操作：**
+
+```bash
+# 第 1 步：停 Redis，随即持续打读接口（未命中 L1 的请求才会走到 Redis）
+docker compose stop redis
+while true; do curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" localhost:8081/shop/999999; sleep 0.2; done
+```
+
+**预期现象（按时间线）：**
+
+| 阶段 | 现象 | 指标证据 |
+| --- | --- | --- |
+| 0~5 次调用（学习期） | 响应约 800ms 失败（Redis 命令超时收敛，不再是 60s 挂起） | `hmdp_resilience_breaker_event_total{breaker="redisBreaker",kind="error"}` 递增 |
+| 失败率 ≥50%（窗口 20/最少 10） | 熔断打开，之后全部请求 ~0ms 快速失败 | `resilience4j_circuitbreaker_state{state="open"}` 变 1；`hmdp_resilience_breaker_transition_total{breaker="redisBreaker",state="open"}` +1 |
+| 打开期间 | 读请求降级回源 DB（受 dbFallbackBulkhead 保护），秒杀返回 503 语义化错误 | `hmdp_resilience_fallback_total{breaker="redisBreaker",kind="not_permitted"}` 递增 |
+| 10s 后 | 自动进半开，放行最多 3 次探测 | `resilience4j_circuitbreaker_state{state="half_open"}` 变 1 |
+
+**恢复观察：**
+
+```bash
+# 第 2 步：Redis 回来后，不重启应用
+docker compose start redis
+# 继续打接口：半开期的探测调用成功 → 熔断闭合，业务自动恢复
+```
+
+预期：`resilience4j_circuitbreaker_state{state="closed"}` 回到 1，
+`hmdp_resilience_breaker_transition_total{breaker="redisBreaker",state="closed"}` +1，
+`/shop/1` 恢复 200。全程无人工干预。
+
+**对照检查点**：Redis 挂期间限流器是 fail-open 的（`hmdp_ratelimit_fallback_total{strategy="fail_open"}` 递增），
+但业务层库存/一人一单仍 fail-closed——限流组件坏了不放大故障，这是设计哲学（见第 8 节）。
+
+### 9.2 演练二：MySQL 挂（dbBreaker）
+
+**分步操作：**
+
+```bash
+# 第 1 步：先登录拿 token（前端页面登录，或 /user/code + /user/login 流程）
+# 第 2 步：停 MySQL，持续秒杀（需要库存的秒杀券；带登录态）
+docker compose stop mysql
+curl -s -X POST localhost:8081/voucher-order/seckill/{voucherId} -H "authorization: <token>"
+```
+
+**预期现象：**
+
+| 环节 | 现象 | 指标证据 |
+| --- | --- | --- |
+| 入口（Lua 预扣成功后） | 不再谎报成功，返回 `code=1100`（ORDER_PROCESSING「下单处理中」） | `hmdp_seckill_degraded_total{breaker="dbBreaker",reason="db_degraded"}` 递增；`hmdp_seckill_result_total{reason="db_degraded"}` 同步递增 |
+| 消费端 | 落库失败 → RECONSUME_LATER 重投，重试上限后进死信 topic | `hmdp_order_consume_total{result="error"}`、`hmdp_order_dead_letter_total` 递增 |
+| mqBreaker（若 MQ 也受影响） | 事务消息快速失败，返回 5004 | `hmdp_seckill_degraded_total{breaker="mqBreaker",reason="mq_send_error"}` 递增 |
+
+**恢复观察：**
+
+```bash
+docker compose start mysql
+```
+
+预期：dbBreaker 15s 后半开 → 探测落库成功 → 闭合；此后新订单正常落库，
+此前积压的 Redis 预扣由对账补单任务（`SeckillReconcileTask`）补齐——降级期间的订单不丢单，只是延迟。
+
+### 9.3 一分钟版本（速查）
+
+```bash
+docker compose stop redis   # 挂
+# → /shop/999999 从 60s 挂起变 800ms 语义化失败；redisBreaker open → half_open
+docker compose start redis  # 恢复
+# → 不重启应用，state 回 closed，业务自动恢复
+curl -s localhost:8081/actuator/prometheus | grep hmdp_resilience
+```
+
+三条验收结论：**全量降级动作在 Prometheus 可见**（上表每一行都有对应序列）；
+**熔断翻转有时间线**（transition 计数 + state Gauge）；
+**演练步骤可复现**（纯 docker compose 操作，无人工数据准备）。

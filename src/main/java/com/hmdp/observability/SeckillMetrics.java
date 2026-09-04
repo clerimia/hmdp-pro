@@ -23,6 +23,7 @@ public class SeckillMetrics {
     public static final String ORDER_CONSUME = "hmdp.order.consume";
     public static final String ORDER_TIMEOUT_SEND_ERROR = "hmdp.order.timeout_send_error";
     public static final String ORDER_DEAD_LETTER = "hmdp.order.dead_letter";
+    public static final String DEGRADED = "hmdp.seckill.degraded";
 
     private final ObservabilityRecorder recorder;
 
@@ -71,6 +72,18 @@ public class SeckillMetrics {
     /** 订单消息超过重试上限落入死信 topic：重试链路已放弃，等待对账/人工介入 */
     public void orderDeadLetter() {
         recorder.increment(ORDER_DEAD_LETTER);
+    }
+
+    /**
+     * 降级量（P3）：按 breaker 维度计入既有 reason 体系，Grafana 用
+     * {@code increase(hmdp_seckill_degraded_total[1m])} 看每分钟降级量。
+     *
+     * @param breaker 触发降级的韧性实例（dbBreaker / mqBreaker）
+     * @param reason  降级在 reason 体系里的对应项（db_degraded / mq_send_error），
+     *                与 {@code hmdp.seckill.result} 同口径，两张图可以互相印证
+     */
+    public void degraded(String breaker, Reason reason) {
+        recorder.increment(DEGRADED, "breaker", breaker, "reason", reason.getCode());
     }
 
     /**

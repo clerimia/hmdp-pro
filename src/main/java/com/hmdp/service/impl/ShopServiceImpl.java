@@ -14,6 +14,7 @@ import io.github.resilience4j.bulkhead.Bulkhead;
 import io.github.resilience4j.bulkhead.BulkheadFullException;
 import io.github.resilience4j.bulkhead.BulkheadRegistry;
 // 注解 @Bulkhead 与上面的核心类同名，这里用全限定名写在方法上（见 queryById）
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.geo.Distance;
@@ -57,6 +58,10 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     @Resource
     private BulkheadRegistry bulkheadRegistry;
 
+    /** 降级打点（P3）：fallback 必须可见，见 docs/observability.md */
+    @Resource
+    private com.hmdp.observability.ResilienceMetrics resilienceMetrics;
+
     /**
      * 查询入口（P1 容错）：
      * <ul>
@@ -93,12 +98,21 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
      */
     private Result queryByIdFallback(Long id, Throwable t) {
         if (t instanceof BulkheadFullException) {
+            // cacheBulkhead 打回 ≠ Redis 故障，但也属于「请求没走正常链路」的韧性动作，一并可见
+            resilienceMetrics.fallback("redisBreaker",
+                    com.hmdp.observability.ResilienceMetrics.KIND_BULKHEAD_REJECTED);
             throw (BulkheadFullException) t;
         }
+        // 降级触发原因：熔断打开（not_permitted）还是学习期真实失败（error）
+        resilienceMetrics.fallback("redisBreaker", t instanceof CallNotPermittedException
+                ? com.hmdp.observability.ResilienceMetrics.KIND_NOT_PERMITTED
+                : com.hmdp.observability.ResilienceMetrics.KIND_ERROR);
         log.warn("Redis 查询降级回源 DB, shopId={}, cause={}", id, t.toString());
         Bulkhead bulkhead = bulkheadRegistry.bulkhead("dbFallbackBulkhead");
         if (!bulkhead.tryAcquirePermission()) {
             // 回源链路也满了：宁可再拒一个，也不让 DB 被打穿
+            resilienceMetrics.fallback("redisBreaker",
+                    com.hmdp.observability.ResilienceMetrics.KIND_BULKHEAD_REJECTED);
             throw BulkheadFullException.createBulkheadFullException(bulkhead);
         }
         try {

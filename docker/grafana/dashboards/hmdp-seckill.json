@@ -224,7 +224,149 @@
         "overrides": []
       },
       "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "熔断状态（OPEN / HALF_OPEN 翻转）",
+      "description": "resilience4j-micrometer 自动上报的熔断状态 Gauge：state=open / half_open = 1 表示正在降级；闭合时应只有 closed=1",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+          "expr": "max by (name, state) (resilience4j_circuitbreaker_state)",
+          "legendFormat": "{{name}} state={{state}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "熔断事件（每分钟，按 breaker/kind）",
+      "description": "kind=error 是学习窗口内的真实依赖失败；kind=not_permitted 是熔断打开后被快速打回的调用，即降级拒流量",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+          "expr": "sum(increase(hmdp_resilience_breaker_event_total[1m])) by (breaker, kind)",
+          "legendFormat": "{{breaker}} kind={{kind}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "熔断状态翻转（每分钟，按 breaker/state）",
+      "description": "open 翻转说明熔断打开；half_open 表示探测窗口；closed 说明恢复闭合——故障演练时看这条时间线",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+          "expr": "sum(increase(hmdp_resilience_breaker_transition_total[1m])) by (breaker, state)",
+          "legendFormat": "{{breaker}} -> {{state}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "降级与重试动作（每分钟）",
+      "description": "fallback = 降级动作打点（not_permitted=熔断快速失败 / error=学习期失败 / bulkhead_rejected=舱壁打回）；retry = 只读链路重试",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+          "expr": "sum(increase(hmdp_resilience_fallback_total[1m])) by (breaker, kind)",
+          "legendFormat": "fallback {{breaker}} kind={{kind}}",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+          "expr": "sum(increase(hmdp_resilience_retry_total[1m])) by (retry, kind)",
+          "legendFormat": "retry {{retry}} kind={{kind}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "秒杀降级量（每分钟，按 breaker/reason）",
+      "description": "降级量混入 SeckillMetrics 的 reason 体系：db_degraded（dbBreaker 打开，返回「下单处理中」）/ mq_send_error（mqBreaker 打开，下单快速失败），与秒杀结果分布面板同口径互相印证",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
+          "expr": "sum(increase(hmdp_seckill_degraded_total[1m])) by (breaker, reason)",
+          "legendFormat": "{{breaker}} reason={{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi" }
+      }
     }
+
   ],
   "refresh": "5s",
   "schemaVersion": 39,

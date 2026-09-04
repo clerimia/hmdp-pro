@@ -378,6 +378,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 // getSeckillResult；最终一致性由消费重试 + 死信 + 对账补单保证。
                 if (dbDegraded()) {
                     reason = SeckillMetrics.Reason.DB_DEGRADED;
+                    seckillMetrics.degraded("dbBreaker", SeckillMetrics.Reason.DB_DEGRADED);
                     return Result.fail(ErrorCode.ORDER_PROCESSING);
                 }
                 return Result.ok(orderId);
@@ -447,6 +448,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             // dbBreaker 打开 = 消费端落库无期，与方案 A 同一语义：诚实返回「处理中」
             if (dbDegraded()) {
                 reason = SeckillMetrics.Reason.DB_DEGRADED;
+                seckillMetrics.degraded("dbBreaker", SeckillMetrics.Reason.DB_DEGRADED);
                 return Result.fail(ErrorCode.ORDER_PROCESSING);
             }
             return Result.ok(orderId);

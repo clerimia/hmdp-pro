@@ -41,6 +41,12 @@ public class RocketMQProducer {
     @Resource
     private SeckillTransactionListener seckillTransactionListener;
 
+    @Resource
+    private com.hmdp.observability.ResilienceMetrics resilienceMetrics;
+
+    @Resource
+    private com.hmdp.observability.SeckillMetrics seckillMetrics;
+
     private TransactionMQProducer producer;
 
     @PostConstruct
@@ -100,6 +106,10 @@ public class RocketMQProducer {
                                                             Throwable t) throws Exception {
         if (t instanceof CallNotPermittedException) {
             log.warn("mqBreaker 熔断打开，事务消息快速失败, orderId={}", order.getId());
+            // 降级可见（P3）：fallback 打点 + 秒杀 reason 体系里的 mq_send_error 降级量
+            resilienceMetrics.fallback(
+                    "mqBreaker", com.hmdp.observability.ResilienceMetrics.KIND_NOT_PERMITTED);
+            seckillMetrics.degraded("mqBreaker", com.hmdp.observability.SeckillMetrics.Reason.MQ_SEND_ERROR);
             throw new SystemException(ErrorCode.SYS_MQ_UNAVAILABLE, ErrorCode.SYS_MQ_UNAVAILABLE.getMessage());
         }
         if (t instanceof Exception) {
@@ -128,6 +138,9 @@ public class RocketMQProducer {
     private SendResult sendOrderCreateFallback(VoucherOrder order, Throwable t) throws Exception {
         if (t instanceof CallNotPermittedException) {
             log.warn("mqBreaker 熔断打开，普通消息快速失败, orderId={}", order.getId());
+            resilienceMetrics.fallback(
+                    "mqBreaker", com.hmdp.observability.ResilienceMetrics.KIND_NOT_PERMITTED);
+            seckillMetrics.degraded("mqBreaker", com.hmdp.observability.SeckillMetrics.Reason.MQ_SEND_ERROR);
             throw new SystemException(ErrorCode.SYS_MQ_UNAVAILABLE, ErrorCode.SYS_MQ_UNAVAILABLE.getMessage());
         }
         if (t instanceof Exception) {
