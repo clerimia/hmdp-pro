@@ -25,6 +25,16 @@ public enum ErrorCode {
     ORDER_REPEAT(1004, "不能重复下单"),
     ORDER_NOT_FOUND(1005, "订单不存在"),
     ORDER_CLOSED(1006, "订单已关闭"),
+    /** 活动未到 beginTime：秒杀入口的时间闸门，缺失时活动没开抢就能被抢光 */
+    SECKILL_NOT_STARTED(1007, "活动尚未开始"),
+    /** 活动已过 endTime */
+    SECKILL_ENDED(1008, "活动已结束"),
+    /**
+     * 预热查不到该券时统一返回这个码。
+     * 覆盖两种情况：券 id 根本不存在；券存在但 tb_seckill_voucher 里没记录（即普通券）。
+     * 预热服务无法区分二者（都是 getById 返回 null），所以合成一个码。
+     */
+    VOUCHER_NOT_SECKILL(1009, "该优惠券不是秒杀券"),
 
     /**
      * 降级专用：Redis 预扣成功但订单尚未落库（DB 熔断打开、或 MQ 积压）。

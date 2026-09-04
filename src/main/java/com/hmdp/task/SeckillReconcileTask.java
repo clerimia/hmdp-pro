@@ -8,7 +8,6 @@ import com.hmdp.mq.RocketMQProducer;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import com.hmdp.utils.RedisConstants;
-import com.hmdp.utils.SeckillMode;
 
 import static com.hmdp.utils.RedisConstants.SECKILL_STOCK_KEY;
 
@@ -138,10 +137,10 @@ public class SeckillReconcileTask {
 
     /**
      * ② 补单：兜 CREATE 消息丢失（Redis 已扣库存、订单表缺失）。
-     * 只对已结束的券执行——进行中的秒杀，claim 后消费者存在秒级落库延迟，
+     * 只对已结束的券执行——进行中的秒杀，入口 Lua 扣减后消费者存在秒级落库延迟，
      * 对账过早跑差集会误判丢单（白打 MQ、日志误报）。
-     * seckill:order:{voucherId}（Lua claim 用户）与订单表已落库用户的差集 = 丢单；
-     * 重新发号补发 CREATE 消息，消费者幂等链（锁→count→唯一索引）保证不重复建单。
+     * seckill:order:{voucherId}（Lua 已扣库存的用户）与订单表已落库用户的差集 = 丢单；
+     * 重新发号补发 CREATE 消息，消费者靠主键 orderId 去重，重复补发不会建出重复单。
      */
     private void supplementMissingOrders() {
         List<SeckillVoucher> vouchers = seckillVoucherService.lambdaQuery()
@@ -170,8 +169,8 @@ public class SeckillReconcileTask {
                 order.setId(uidGenerator.getUID());
                 order.setUserId(Long.valueOf(userId));
                 order.setVoucherId(voucherId);
-                // 补单场景：入口已扣 Redis（claim 已在集合中），消费者走方案 A 路径直接落库，不再 claim
-                order.setSeckillMode(SeckillMode.A);
+                // 补单场景：该用户已在 seckill:order:{voucherId} 集合里（入口 Lua 已扣过库存），
+                // 只是订单没落库，消费者直接落库即可
                 try {
                     rocketMQProducer.sendOrderCreate(order);
                     log.warn("对账补单：voucherId={}, userId={}, 新订单号={}", voucherId, userId, order.getId());

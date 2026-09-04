@@ -55,11 +55,17 @@ services:
       - redis-data:/data
     # maxmemory-policy 说明：
     #   默认 noeviction 在内存打满后直接拒绝写（登录/秒杀全挂），必须显式配。
-    #   本实例以缓存为主（商铺缓存 / 空值标记都带 TTL），选 allkeys-lru：
-    #   内存压力下优先驱逐最久未访问的 key，缓存被逐最多回源 DB，语义无损。
-    #   注意：秒杀库存等 key 也可能被逐，本地开发可接受；生产若把
-    #   「不可丢」数据放缓存实例，应拆实例并配 noeviction + 合理 maxmemory。
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    #   选 volatile-lru（只驱逐【设了过期时间】的 key），而不是 allkeys-lru：
+    #     - 缓存类 key（商铺缓存 / 空值标记 / 排队状态 / 事务标记）都带 TTL，
+    #       被逐最多回源 DB 或重查，语义无损 —— 它们是天然的淘汰候选。
+    #     - 秒杀库存 seckill:stock:* 与下单用户集合 seckill:order:* 不带 TTL，
+    #       volatile-lru 永不驱逐它们。这点很关键：库存被逐 = 库存凭空消失，
+    #       Lua 判 stock==nil 会让秒杀全部失败；更糟的是若此时按 DB 值回填
+    #       （而 DB 落后于 Redis）会直接超卖。
+    #   代价：若内存打满时剩余的全是无 TTL key，写会被拒绝（退化成 noeviction）。
+    #   本项目有 TTL 的 key 占绝大多数，256mb 足够，可接受。
+    #   生产进一步加固：把不可丢数据拆到独立实例，配 noeviction + 合理 maxmemory。
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy volatile-lru
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

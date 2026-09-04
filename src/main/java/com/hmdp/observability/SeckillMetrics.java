@@ -98,6 +98,12 @@ public class SeckillMetrics {
         SUCCESS(true, "success"),
         STOCK_OUT(false, "stock_out"),
         REPEAT(false, "repeat"),
+        /** 券不存在，或存在但不是秒杀券（预热查不到，含命中的空值标记） */
+        VOUCHER_NOT_SECKILL(false, "voucher_not_seckill"),
+        /** 活动窗口未到开始时间 */
+        NOT_STARTED(false, "not_started"),
+        /** 活动已结束 */
+        ENDED(false, "ended"),
         RATE_LIMITED(false, "rate_limited"),
         MQ_SEND_ERROR(false, "mq_send_error"),
         /** dbBreaker 打开/半开，落库无期，入口诚实返回「下单处理中」而非成功 */

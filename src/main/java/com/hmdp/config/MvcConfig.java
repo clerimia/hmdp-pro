@@ -31,8 +31,11 @@ public class MvcConfig implements WebMvcConfigurer {
                         "/user/code",
                         "/user/login"
                 ).order(1);
+        // 精确到「下单」这一个动作，不用 /voucher-order/seckill/** ——
+        // 后者会连 GET /seckill/result/{orderId}（结果轮询）一起限流：
+        // 用户轮询几次就烧光自己的下单配额，且指标基数被轮询抬高。
         registry.addInterceptor(slidingWindowInterceptor)
-                .addPathPatterns("/voucher-order/seckill/**")
+                .addPathPatterns("/voucher-order/seckill/{id}")
                 .order(2);
     }
 }

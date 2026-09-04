@@ -32,7 +32,8 @@ public class VoucherOrderController {
     }
 
     /**
-     * 秒杀异步结果查询（方案 B：WAITING/SUCCESS/FAIL_*；方案 A 可查订单表兜底）
+     * 秒杀异步结果查询：WAITING=已预扣待落库 / SUCCESS=已落库 / FAIL_*=落库失败。
+     * 排队状态缺失时（TTL 过期或写入失败）回落到订单表兜底。
      */
     @GetMapping("seckill/result/{orderId}")
     public Result seckillResult(@PathVariable("orderId") Long orderId) {

@@ -1,21 +1,38 @@
 package com.hmdp.utils;
 
 /**
- * 秒杀方案模式与排队状态（开源双方案可切换）
+ * 秒杀方案标识与排队状态。
+ *
+ * <p><b>曾有过两种写路径（A/B），现只保留 A。</b>
+ * 原方案 B 是「入口只限流入队、库存与一人一单校验下沉到消费者」，
+ * 削峰靠 MQ 堆积。删除它的原因：
+ * <ul>
+ *   <li>两条路径共用一套落库与对账代码，消费端到处是 {@code if (modeB)} 分支，
+ *       改动任一路径都要在脑内跑两遍推演，维护成本高于收益；</li>
+ *   <li>方案 A 的入口 Lua 已经把库存与一人一单校验完了，B 的「校验下沉」
+ *       只是把同样的判断换个地方做，削峰能力可以由网关令牌桶 + 应用层滑动窗口承担；</li>
+ *   <li>前端（hm-dianping 静态页）从未实现 B 所需的轮询，B 路径实际上没人走完整。</li>
+ * </ul>
+ * 保留 {@link #A} 是因为它同时是指标的 {@code mode} tag 值，去掉会让历史面板断档。
  */
 public final class SeckillMode {
 
     private SeckillMode() {
     }
 
-    /** 方案 A：入口 Lua 预扣库存 + 事务消息，适合中小流量 / 要同步结果 */
+    /** 唯一写路径：入口 Lua 预扣库存与一人一单 + 事务消息异步落库 */
     public static final String A = "A";
-    /** 方案 B：入口只限流入队，校验下沉消费者，适合超大洪峰削峰 */
-    public static final String B = "B";
 
+    /** 已入队/已预扣成功，等待消费者落库 */
     public static final String QUEUE_WAITING = "WAITING";
+    /** 落库成功 */
     public static final String QUEUE_SUCCESS = "SUCCESS";
+    /** 落库时发现库存不足 */
     public static final String QUEUE_FAIL_STOCK = "FAIL_STOCK";
+    /** 落库时发现重复下单 */
     public static final String QUEUE_FAIL_REPEAT = "FAIL_REPEAT";
+    /** 系统故障导致未能落库 */
     public static final String QUEUE_FAIL_SYSTEM = "FAIL_SYSTEM";
+    /** 查不到该订单：排队状态与订单表都没有（TTL 过期、写入失败，或 orderId 是伪造的） */
+    public static final String QUEUE_NOT_FOUND = "NOT_FOUND";
 }

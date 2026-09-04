@@ -18,6 +18,12 @@ public class RedisConstants {
     public static final Long LOCK_SHOP_TTL = 10L;
 
     public static final String SECKILL_STOCK_KEY = "seckill:stock:";
+    /** 秒杀券活动元信息 hash（字段 begin/end = 毫秒时间戳），入口校验活动窗口用 */
+    public static final String SECKILL_META_KEY = "seckill:meta:";
+    /** 活动元信息 TTL（小时）：活动信息基本静态，长 TTL 减少回源；到期自动重新预热 */
+    public static final long SECKILL_META_TTL_HOURS = 24L;
+    /** 预热互斥锁前缀：缓存击穿时只放行一个线程回源 DB */
+    public static final String LOCK_SECKILL_WARM_KEY = "lock:seckill:warm:";
     /** 秒杀成功 claim 用户集合（Lua 脚本 SADD 写入，一人一单与补单差集依据） */
     public static final String SECKILL_ORDER_KEY = "seckill:order:";
     /** RocketMQ 事务消息本地标记（与 Lua 扣库存同脚本写入，回查用） */

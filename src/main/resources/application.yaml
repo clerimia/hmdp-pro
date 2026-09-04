@@ -5,7 +5,9 @@ spring:
     name: hmdp-pro
   datasource:
     driver-class-name: com.mysql.jdbc.Driver
-    url: jdbc:mysql://127.0.0.1:3306/hmdp?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true
+    # serverTimezone 必须与容器 TZ、JVM 默认时区三者一致，否则 timestamp 字段
+    # 会被二次偏移（秒杀活动提前 8 小时开抢）。详见 application-local.yaml 注释。
+    url: jdbc:mysql://127.0.0.1:3306/hmdp?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
     username: your_mysql_user
     password: your_mysql_password
     hikari:
@@ -36,15 +38,28 @@ mybatis-plus:
 # ===== RocketMQ 消息队列 =====
 rocketmq:
   name-server: 127.0.0.1:9876
-# ===== 秒杀方案：A=入口预扣+事务消息；B=限流入队+消费者校验 =====
+# ===== 秒杀：入口 Lua 预扣库存与一人一单 + 事务消息异步落库 =====
+# （原方案 B「入队后由消费者校验」已删除，理由见 SeckillMode 类注释）
 seckill:
-  mode: A
   # 二级限流第二层：业务滑动窗口（第一层在 OpenResty 网关令牌桶）
   rate-limit:
     sliding-window:
       enabled: true
+      # 下单动作：严格，挡连点与脚本
       window-ms: 1000      # 窗口 1 秒
       max-requests: 5      # 同一用户窗口内最多 5 次秒杀请求
+      # 结果查询（轮询）：单独配额，与下单互不占用（共用一个 key 会让前端
+      # 多查几次结果就烧光自己的下单额度）。
+      # 注意轮询规模本身被库存数封顶——只有抢到的人才有 orderId 可查，
+      # 不存在「几十万人同时轮询」。这道限流真正防的是伪造 orderId 反复查询、
+      # 打穿排队状态缓存直落 DB（见 VoucherOrderServiceImpl#getSeckillResult）。
+      result-window-ms: 1000
+      result-max-requests: 10
+      # 支付结果查询（轮询是否支付成功）：同样单独配额。
+      # 与落库查询分开是因为两者生命周期不同——落库秒级收敛，
+      # 支付要等到 15 分钟关单窗口，共用会互相干扰。
+      pay-window-ms: 1000
+      pay-max-requests: 10
 
 # ===== 百度 UidGenerator（订单号生成，见 UidGeneratorConfig）=====
 # 位分配: sign(1) + time(28) + worker(22) + seq(13) = 63bit

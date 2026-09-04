@@ -51,4 +51,15 @@ public class Result {
     public static Result fail(ErrorCode errorCode, String errorMsg) {
         return new Result(false, errorCode.getCode(), errorMsg, null, null);
     }
+
+    /**
+     * 按错误码失败并携带数据。
+     *
+     * <p>用于降级场景：秒杀返回 ORDER_PROCESSING 时必须把 orderId 一起回给前端，
+     * 否则前端拿到一句「处理中」却无从查询后续结果。
+     * 注意 HTTP 状态码仍是 200 —— 前端必须判 {@code success/code}，不能只看状态码。
+     */
+    public static Result fail(ErrorCode errorCode, Object data) {
+        return new Result(false, errorCode.getCode(), errorCode.getMessage(), data, null);
+    }
 }
