@@ -79,8 +79,11 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     @Override
     public Result queryById(Long id) {
         // 多级缓存：Caffeine(L1 JVM) → Redis逻辑过期(L2) → MySQL(L3)
-        Shop shop = multiLevelCache
-                .queryWithMultiLevel(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
+        // 版本感知：写回前比对快照 update_time 与 DB 当前值，治"成功的脏写"
+        // （读 DB 与写缓存之间的空隙里恰有更新提交并删缓存，旧快照不得回填）
+        Shop shop = multiLevelCache.queryWithMultiLevel(CACHE_SHOP_KEY, id, Shop.class,
+                this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES,
+                Shop::getUpdateTime, shopId -> baseMapper.selectUpdateTimeById(shopId));
 
         if (shop == null) {
             return Result.fail("店铺不存在！");

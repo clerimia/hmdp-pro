@@ -13,6 +13,9 @@ public class CacheMetrics {
 
     public static final String CACHE_HIT = "hmdp.cache.hit";
 
+    /** 写回侧版本核验：快照落后于 DB，放弃写回（治"成功的脏写"） */
+    public static final String CACHE_STALE_SKIP = "hmdp.cache.stale_skip";
+
     /** 命中层级：L1 Caffeine / L2 Redis / L3 DB */
     public static final String LEVEL_L1 = "l1";
 
@@ -34,5 +37,10 @@ public class CacheMetrics {
     /** 命中层级分布，用于算多级缓存命中率 */
     public void hit(String level) {
         recorder.increment(CACHE_HIT, "level", level);
+    }
+
+    /** 写回侧版本核验失败：快照落后于 DB，放弃写回。每次出现 = 撞上一次"重建期间并发更新" */
+    public void staleSkip() {
+        recorder.increment(CACHE_STALE_SKIP);
     }
 }

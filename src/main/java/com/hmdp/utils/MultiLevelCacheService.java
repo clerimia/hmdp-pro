@@ -96,6 +96,32 @@ public class MultiLevelCacheService {
     public <R, ID> R queryWithMultiLevel(
             String keyPrefix, ID id, Class<R> type,
             Function<ID, R> dbFallback, Long ttl, TimeUnit unit) {
+        return queryWithMultiLevel(keyPrefix, id, type, dbFallback, ttl, unit, null, null);
+    }
+
+    /**
+     * 版本感知变体：写回前核验快照版本，治"成功的脏写"。
+     *
+     * <p><b>竞态</b>：回查 DB 与写回缓存是两个 separated 动作，中间空隙里运营可能提交
+     * 更新并删缓存——旧快照随后被写回，且带着崭新的逻辑过期时间和重置的物理 TTL
+     * （等于给脏数据续命），系统外观一切健康。
+     *
+     * <p><b>为什么比对 DB 而不是 Redis 现有值</b>：删除式 Cache-Aside 下更新方只删不写，
+     * 竞态最致命的形态恰好发生在 key 被删之后——Redis 里没有现值可比，比对形同虚设。
+     * 版本权威必须取自唯一不会消失的真相源（DB 的 update_time，
+     * 由 ON UPDATE CURRENT_TIMESTAMP 自动维护，天然是行级版本号）。
+     *
+     * <p>调用侧请走 6 参重载（带 {@code @Retry}）；本变体是它的实现载体。
+     *
+     * @param snapshotVersionOf    从回查结果取版本（如 {@code Shop::getUpdateTime}），null = 关闭核验
+     * @param currentVersionLoader 查 DB 当前行版本，null = 关闭核验
+     */
+    @SuppressWarnings("unchecked")
+    public <R, ID> R queryWithMultiLevel(
+            String keyPrefix, ID id, Class<R> type,
+            Function<ID, R> dbFallback, Long ttl, TimeUnit unit,
+            Function<R, LocalDateTime> snapshotVersionOf,
+            Function<ID, LocalDateTime> currentVersionLoader) {
 
         String cacheKey = keyPrefix + id;
 
@@ -124,7 +150,7 @@ public class MultiLevelCacheService {
             }
 
             // 逻辑过期 → 异步重建（返回旧数据不阻塞请求）
-            rebuildAsync(keyPrefix, id, dbFallback, ttl, unit);
+            rebuildAsync(keyPrefix, id, dbFallback, ttl, unit, snapshotVersionOf, currentVersionLoader);
             // 返回旧数据
             shopLocalCache.put(cacheKey, data);
             return data;
@@ -137,7 +163,8 @@ public class MultiLevelCacheService {
 
         // ── 第三层：查 MySQL（互斥锁防击穿）──
         cacheMetrics.hit(CacheMetrics.LEVEL_DB);
-        R result = queryWithMutexLock(keyPrefix, id, type, dbFallback, ttl, unit);
+        R result = queryWithMutexLock(keyPrefix, id, type, dbFallback, ttl, unit,
+                snapshotVersionOf, currentVersionLoader);
         if (result != null) {
             shopLocalCache.put(cacheKey, result);
         }
@@ -165,7 +192,9 @@ public class MultiLevelCacheService {
      */
     private <R, ID> R queryWithMutexLock(
             String keyPrefix, ID id, Class<R> type,
-            Function<ID, R> dbFallback, Long ttl, TimeUnit unit) {
+            Function<ID, R> dbFallback, Long ttl, TimeUnit unit,
+            Function<R, LocalDateTime> snapshotVersionOf,
+            Function<ID, LocalDateTime> currentVersionLoader) {
 
         String key = keyPrefix + id;
         RLock lock = redissonClient.getLock(LOCK_SHOP_KEY + id);
@@ -185,7 +214,8 @@ public class MultiLevelCacheService {
                 if (StrUtil.isNotBlank(json)) {
                     return fromLogicalExpireJson(json, type);
                 }
-                return loadAndCache(key, id, dbFallback, ttl, unit);
+                return loadAndCache(key, id, dbFallback, ttl, unit,
+                        snapshotVersionOf, currentVersionLoader);
             } finally {
                 // 仅当前线程持有时释放，避免递归重试路径误删他人持有的锁
                 if (lock.isHeldByCurrentThread()) {
@@ -227,15 +257,26 @@ public class MultiLevelCacheService {
         return JSONUtil.toBean((cn.hutool.json.JSONObject) redisData.getData(), type);
     }
 
-    /** 持锁回源：查 DB → 空值防穿透 / 写逻辑过期缓存 */
+    /**
+     * 持锁回源：查 DB → 空值防穿透 / 写逻辑过期缓存。
+     * 写回前核验快照版本：竞态下（读 DB 后、写回前恰有更新提交并删缓存）放弃写回，
+     * 避免旧快照带着崭新的逻辑过期时间与重置的物理 TTL 被写进 Redis。
+     */
     private <R, ID> R loadAndCache(
-            String key, ID id, Function<ID, R> dbFallback, Long ttl, TimeUnit unit) {
+            String key, ID id, Function<ID, R> dbFallback, Long ttl, TimeUnit unit,
+            Function<R, LocalDateTime> snapshotVersionOf,
+            Function<ID, LocalDateTime> currentVersionLoader) {
         R result = dbFallback.apply(id);
         if (result == null) {
             // 空值缓存防穿透，加随机 TTL
             long randomTtl = CACHE_NULL_TTL + RANDOM.nextInt(3);
             stringRedisTemplate.opsForValue().set(key, "", randomTtl, TimeUnit.MINUTES);
             return null;
+        }
+        // 版本核验：快照落后于 DB → 不写缓存，只把数据返回给当前请求。
+        // key 此时多半已被 evict 删掉，下一个请求会 miss → 互斥锁回源，拿到必然新鲜的值
+        if (isStaleSnapshot(id, result, snapshotVersionOf, currentVersionLoader)) {
+            return result;
         }
         // 写入 Redis（逻辑过期模式）
         writeWithLogicalExpire(key, result, ttl, unit);
@@ -246,7 +287,9 @@ public class MultiLevelCacheService {
      * 异步重建过期缓存
      */
     private <R, ID> void rebuildAsync(
-            String keyPrefix, ID id, Function<ID, R> dbFallback, Long ttl, TimeUnit unit) {
+            String keyPrefix, ID id, Function<ID, R> dbFallback, Long ttl, TimeUnit unit,
+            Function<R, LocalDateTime> snapshotVersionOf,
+            Function<ID, LocalDateTime> currentVersionLoader) {
 
         RLock lock = redissonClient.getLock(LOCK_SHOP_KEY + id);
         rebuildExecutor.submit(() -> {
@@ -264,7 +307,8 @@ public class MultiLevelCacheService {
             }
             try {
                 R data = dbFallback.apply(id);
-                if (data != null) {
+                if (data != null && !isStaleSnapshot(id, data,
+                        snapshotVersionOf, currentVersionLoader)) {
                     writeWithLogicalExpire(keyPrefix + id, data, ttl, unit);
                 }
                 cacheMetrics.rebuilt(true);
@@ -279,6 +323,40 @@ public class MultiLevelCacheService {
                 }
             }
         });
+    }
+
+    /**
+     * 写回侧版本核验：快照的 update_time 落后于 DB 当前行 → 判定为脏，放弃写回。
+     *
+     * <p>核验失败的后果是安全的：key 要么已被 evict 删掉（下一请求 miss → 互斥锁回源，
+     * 拿到必然新鲜的值），要么还留着未过期的旧值（下一个逻辑过期周期重建自愈）。
+     * 核验本身只查一列（PK 查询），发生在每次重建/回源时，频率低、成本可忽略。
+     *
+     * <p>残余窗口如实声明：查版本与写入之间理论上仍可插入更新，概率比原竞态低
+     * 数量级，接受；要绝对严格需把"读-比-写"整体串行化，代价不成比例。
+     */
+    private <R, ID> boolean isStaleSnapshot(
+            ID id, R snapshot,
+            Function<R, LocalDateTime> snapshotVersionOf,
+            Function<ID, LocalDateTime> currentVersionLoader) {
+        if (snapshotVersionOf == null || currentVersionLoader == null) {
+            return false; // 未启用版本核验（非实体缓存或调用方未提供）
+        }
+        LocalDateTime snapVer = snapshotVersionOf.apply(snapshot);
+        if (snapVer == null) {
+            return false; // 快照无版本字段，退回旧行为
+        }
+        LocalDateTime dbVer = currentVersionLoader.apply(id);
+        if (dbVer == null) {
+            return false; // 行可能已被删除，保守按旧行为处理（写回交给后续 evict/TTL 收敛）
+        }
+        boolean stale = snapVer.isBefore(dbVer);
+        if (stale) {
+            cacheMetrics.staleSkip();
+            log.info("[多级缓存] 快照版本落后，跳过写回: id={}, snapVer={}, dbVer={}",
+                    id, snapVer, dbVer);
+        }
+        return stale;
     }
 
     /**
