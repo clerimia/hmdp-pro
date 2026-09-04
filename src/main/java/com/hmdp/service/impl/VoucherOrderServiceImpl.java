@@ -18,6 +18,9 @@ import com.hmdp.utils.UserHolder;
 // 注意：注解 @Bulkhead 与核心类 io.github.resilience4j.bulkhead.Bulkhead 同名，
 // 同文件里只 import 注解，Type.SEMAPHORE 用全限定名引用（见下方注解）
 import io.github.resilience4j.bulkhead.annotation.Bulkhead;
+// 注意：io.github.resilience4j.circuitbreaker.CircuitBreaker（核心类）与
+// @CircuitBreaker 注解同名，同文件里只 import 注解，核心类用全限定名引用（见 dbDegraded）
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.client.producer.SendResult;
@@ -65,6 +68,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private RocketMQProducer rocketMQProducer;
     @Resource
     private SeckillMetrics seckillMetrics;
+    /** 落库降级语义用：读取 dbBreaker 实时状态，判断「订单还要多久才能落库」 */
+    @Resource
+    private CircuitBreakerRegistry circuitBreakerRegistry;
 
     /** 秒杀方案：A=入口预扣+事务消息；B=限流入队+消费者校验 */
     @Value("${seckill.mode:A}")
@@ -152,7 +158,17 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      * MQ 消费者异步落库入口：幂等创建订单
      * 方案 A：入口已扣 Redis，此处落库 + DB 二次扣库存
      * 方案 B：此处先 claim Redis，再落库，并回写排队终态
+     *
+     * <p>P2 容错：{@code dbBreaker}（50%/窗口 20/半开 15s）包裹整个落库流程。
+     * 熔断打开后方法入口即抛 {@code CallNotPermittedException}，消费端 catch 后返回
+     * RECONSUME_LATER 延迟重投——不碰 DB 也不碰 Redis，配合消息重试上限 + 死信 +
+     * 对账补单形成完整兜底阶梯。
+     *
+     * <p>已知权衡：方法内的 Redisson 锁 / claim 脚本失败也会计入 dbBreaker
+     * （Redis 故障打开 DB 熔断器）。可接受——消费端任何一环挂掉都应快速重投而不是
+     * 占着消费线程干等；误开窗口只有半开期 15s，消息重投天然覆盖。
      */
+    @CircuitBreaker(name = "dbBreaker")
     public void createOrderFromMQ(VoucherOrder voucherOrder) {
         Long userId = voucherOrder.getUserId();
         Long voucherId = voucherOrder.getVoucherId();
@@ -245,7 +261,15 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             try {
                 rocketMQProducer.sendOrderTimeout(voucherOrder.getId());
             } catch (Exception e) {
-                log.error("超时关单延迟消息发送失败，订单 {} 缺少自动关单保障", voucherOrder.getId(), e);
+                // 关单延迟消息发送失败：只记日志的话订单会永远停在「未支付」（无自动关单保障）。
+                // 升级为：记入 Redis 重试集合 → 对账任务每轮重发（SeckillReconcileTask#retryTimeoutMessages）
+                // → 重发后仍到不了点还有 closeTimeoutOrders 按 createTime 扫描关单兜底。
+                // cancelTimeoutOrder 是 CAS 幂等（仅未支付才关），重复触发无副作用。
+                seckillMetrics.orderTimeoutSendError();
+                stringRedisTemplate.opsForSet().add(
+                        SECKILL_TIMEOUT_RETRY_KEY, voucherOrder.getId().toString());
+                log.error("超时关单延迟消息发送失败，已记入重试集合等待对账重发, orderId={}",
+                        voucherOrder.getId(), e);
             }
             if (modeB) {
                 writeQueueStatus(orderId, SeckillMode.QUEUE_SUCCESS);
@@ -328,18 +352,34 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             try {
                 SendResult sendResult = rocketMQProducer.sendOrderCreateInTransaction(order, ctx);
                 if (sendResult.getSendStatus() != SendStatus.SEND_OK) {
-                    log.error("事务半消息发送失败, orderId={}, status={}", orderId, sendResult.getSendStatus());
-                    reason = SeckillMetrics.Reason.MQ_SEND_ERROR;
-                    return Result.fail("系统繁忙，请稍后重试");
+                    // 非 OK（FLUSH_DISK_TIMEOUT / SLAVE_NOT_AVAILABLE 等）视同发送失败：
+                    // 抛异常让 mqBreaker 学到这次失败，而不是静默当成功
+                    throw new SystemException(ErrorCode.SYS_MQ_UNAVAILABLE,
+                            ErrorCode.SYS_MQ_UNAVAILABLE.getMessage());
                 }
+            } catch (SystemException e) {
+                reason = SeckillMetrics.Reason.MQ_SEND_ERROR;
+                // 不上抛是有意的：seckillVoucher 外层套着 redisBreaker，MQ 故障的异常穿过去
+                // 会被误记成 Redis 失败，把爆炸半径扩散到健康依赖。转成业务响应
+                // （200 + code=5004「下单通道暂时不可用」），redisBreaker 一个失败都不多记。
+                return Result.fail(e.getErrorCode(), e.getMessage());
             } catch (Exception e) {
                 log.error("事务消息发送异常, userId={}, voucherId={}", userId, voucherId, e);
                 reason = SeckillMetrics.Reason.MQ_SEND_ERROR;
-                return Result.fail("系统繁忙，请稍后重试");
+                return Result.fail(ErrorCode.SYS_MQ_UNAVAILABLE, ErrorCode.SYS_MQ_UNAVAILABLE.getMessage());
             }
 
             long r = ctx.getLuaResult();
             if (r == 0) {
+                // 落库降级语义（P2 关键决策）：Lua 成功只代表 Redis 预扣成功，订单此刻尚未落库，
+                // 要等消费者落库。dbBreaker 打开/半开 = 落库遥遥无期——这时返回"成功"是在撒谎，
+                // 用户会看到「下单成功但订单消失」。说谎的降级比明确的报错更糟：
+                // 诚实返回 ORDER_PROCESSING（业务码 1100），前端凭 code 展示「处理中」并轮询
+                // getSeckillResult；最终一致性由消费重试 + 死信 + 对账补单保证。
+                if (dbDegraded()) {
+                    reason = SeckillMetrics.Reason.DB_DEGRADED;
+                    return Result.fail(ErrorCode.ORDER_PROCESSING);
+                }
                 return Result.ok(orderId);
             }
             if (r == 1) {
@@ -387,18 +427,28 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             try {
                 SendResult sendResult = rocketMQProducer.sendOrderCreate(order);
                 if (sendResult.getSendStatus() != SendStatus.SEND_OK) {
-                    writeQueueStatus(orderId, SeckillMode.QUEUE_FAIL_SYSTEM);
-                    reason = SeckillMetrics.Reason.MQ_SEND_ERROR;
-                    return Result.fail("系统繁忙，请稍后重试");
+                    // 非 OK 视同发送失败：抛异常让 mqBreaker 学到，QUEUE_FAIL_SYSTEM 在 catch 统一写
+                    throw new SystemException(ErrorCode.SYS_MQ_UNAVAILABLE,
+                            ErrorCode.SYS_MQ_UNAVAILABLE.getMessage());
                 }
+            } catch (SystemException e) {
+                writeQueueStatus(orderId, SeckillMode.QUEUE_FAIL_SYSTEM);
+                reason = SeckillMetrics.Reason.MQ_SEND_ERROR;
+                // 同方案 A：不上抛，避免 MQ 故障被外层 redisBreaker 误记为 Redis 失败
+                return Result.fail(e.getErrorCode(), e.getMessage());
             } catch (Exception e) {
                 log.error("方案B发消息失败, userId={}, voucherId={}", userId, voucherId, e);
                 writeQueueStatus(orderId, SeckillMode.QUEUE_FAIL_SYSTEM);
                 reason = SeckillMetrics.Reason.MQ_SEND_ERROR;
-                return Result.fail("系统繁忙，请稍后重试");
+                return Result.fail(ErrorCode.SYS_MQ_UNAVAILABLE, ErrorCode.SYS_MQ_UNAVAILABLE.getMessage());
             }
             // 方案 B 的「成功」指成功入队，真正的库存校验在消费者侧，
-            // 落库结果由 hmdp_order_consume_* 与 hmdp_seckill_result_*（消费侧补）反映
+            // 落库结果由 hmdp_order_consume_* 与 hmdp_seckill_result_*（消费侧补）反映。
+            // dbBreaker 打开 = 消费端落库无期，与方案 A 同一语义：诚实返回「处理中」
+            if (dbDegraded()) {
+                reason = SeckillMetrics.Reason.DB_DEGRADED;
+                return Result.fail(ErrorCode.ORDER_PROCESSING);
+            }
             return Result.ok(orderId);
         } finally {
             seckillMetrics.finishSeckill(sample, SeckillMode.B, reason);
@@ -437,6 +487,17 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 SECKILL_QUEUE_TTL_MINUTES,
                 TimeUnit.MINUTES
         );
+    }
+
+    /**
+     * 落库是否处于降级窗口：dbBreaker 打开或半开都算。
+     * 半开也返回 true——半开意味着「还没确认恢复」，此刻承诺成功同样可能落空。
+     */
+    private boolean dbDegraded() {
+        io.github.resilience4j.circuitbreaker.CircuitBreaker.State state =
+                circuitBreakerRegistry.circuitBreaker("dbBreaker").getState();
+        return state == io.github.resilience4j.circuitbreaker.CircuitBreaker.State.OPEN
+                || state == io.github.resilience4j.circuitbreaker.CircuitBreaker.State.HALF_OPEN;
     }
 
 }

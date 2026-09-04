@@ -21,6 +21,8 @@ public class SeckillMetrics {
     public static final String SECKILL_LATENCY = "hmdp.seckill.latency";
     public static final String RATE_LIMIT_FALLBACK = "hmdp.ratelimit.fallback";
     public static final String ORDER_CONSUME = "hmdp.order.consume";
+    public static final String ORDER_TIMEOUT_SEND_ERROR = "hmdp.order.timeout_send_error";
+    public static final String ORDER_DEAD_LETTER = "hmdp.order.dead_letter";
 
     private final ObservabilityRecorder recorder;
 
@@ -61,6 +63,16 @@ public class SeckillMetrics {
         recorder.increment(ORDER_CONSUME, "tag", tag, "result", success ? "ok" : "error");
     }
 
+    /** 超时关单延迟消息发送失败（已记入 Redis 重试集合，由对账任务重发） */
+    public void orderTimeoutSendError() {
+        recorder.increment(ORDER_TIMEOUT_SEND_ERROR);
+    }
+
+    /** 订单消息超过重试上限落入死信 topic：重试链路已放弃，等待对账/人工介入 */
+    public void orderDeadLetter() {
+        recorder.increment(ORDER_DEAD_LETTER);
+    }
+
     /**
      * 失败原因枚举（可扩展点④）：tag 值封闭在这个集合内。
      *
@@ -75,6 +87,8 @@ public class SeckillMetrics {
         REPEAT(false, "repeat"),
         RATE_LIMITED(false, "rate_limited"),
         MQ_SEND_ERROR(false, "mq_send_error"),
+        /** dbBreaker 打开/半开，落库无期，入口诚实返回「下单处理中」而非成功 */
+        DB_DEGRADED(false, "db_degraded"),
         SYSTEM_ERROR(false, "system_error");
 
         private final boolean success;

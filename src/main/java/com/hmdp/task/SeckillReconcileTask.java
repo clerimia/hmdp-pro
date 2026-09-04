@@ -30,8 +30,8 @@ import java.util.stream.Collectors;
  * 秒杀对账任务：兜底 MQ 消息丢失与库存漂移
  * <p>
  * 核心思想：Redis/DB 库存都不是真相，订单表才是唯一账本，库存是派生值。
- * 每轮按 ①关单兜底 → ②补单 → ③库存重算 顺序执行，每轮收敛。
- * 订单表修复（①②）必须在库存重算（③）之前：账本先修对，重算才准确。
+ * 每轮按 ⓪关单消息重发 → ①关单兜底 → ②补单 → ③库存重算 顺序执行，每轮收敛。
+ * 订单表修复（⓪①②）必须在库存重算（③）之前：账本先修对，重算才准确。
  */
 @Slf4j
 @Component
@@ -78,6 +78,7 @@ public class SeckillReconcileTask {
             return; // 其他实例正在对账
         }
         try {
+            retryTimeoutMessages();
             closeTimeoutOrders();
             supplementMissingOrders();
             reconcileFinishedStocks();
@@ -87,6 +88,32 @@ public class SeckillReconcileTask {
             // 租期内未跑完时锁已自动过期，此处再 unlock 会抛 IllegalMonitorStateException
             if (lock.isHeldByCurrentThread()) {
                 lock.unlock();
+            }
+        }
+    }
+
+    /**
+     * ⓪ 关单消息重发（P2）：兜消费端 sendOrderTimeout 发送失败。
+     * 失败的 orderId 由消费端记入 seckill:timeout:retry 集合，这里每轮重发，成功即移除。
+     * 重发的延迟消息从当下重新计时 15 分钟，最坏关单延迟 = 重试排队 + 15 分钟；
+     * 下一步 closeTimeoutOrders 按 createTime 扫描关单，保证最终一定关（双保险）。
+     * cancelTimeoutOrder 是 CAS 幂等，重复重发无副作用。
+     */
+    private void retryTimeoutMessages() {
+        Set<String> pending = stringRedisTemplate.opsForSet()
+                .members(RedisConstants.SECKILL_TIMEOUT_RETRY_KEY);
+        if (pending == null || pending.isEmpty()) {
+            return;
+        }
+        for (String idStr : pending) {
+            try {
+                rocketMQProducer.sendOrderTimeout(Long.valueOf(idStr));
+                stringRedisTemplate.opsForSet()
+                        .remove(RedisConstants.SECKILL_TIMEOUT_RETRY_KEY, idStr);
+                log.warn("对账重发关单延迟消息成功, orderId={}", idStr);
+            } catch (Exception e) {
+                // 发送失败不抛异常也不移除，留下轮再试（MQ 挂时本轮全部失败，下轮恢复后自动追平）
+                log.error("对账重发关单延迟消息失败, orderId={}", idStr, e);
             }
         }
     }

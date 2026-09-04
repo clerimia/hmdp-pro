@@ -28,6 +28,8 @@ public class RedisConstants {
     public static final String SECKILL_QUEUE_KEY = "seckill:queue:";
     /** 排队状态 TTL（分钟） */
     public static final long SECKILL_QUEUE_TTL_MINUTES = 5L;
+    /** 超时关单延迟消息发送失败的待重发集合（set，member=orderId），由对账任务每轮重发 */
+    public static final String SECKILL_TIMEOUT_RETRY_KEY = "seckill:timeout:retry";
     public static final String BLOG_LIKED_KEY = "blog:liked:";
     public static final String FEED_KEY = "feed:";
     public static final String SHOP_GEO_KEY = "shop:geo:";

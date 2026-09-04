@@ -59,11 +59,14 @@ Timer `hmdp.seckill.latency` → `hmdp_seckill_latency_seconds_*`。
 | `hmdp.seckill.latency` | Timer | `mode` `result` | 秒杀方案 A/B 方法耗时 |
 | `hmdp.ratelimit.fallback` | Counter | `strategy` | 限流器自身异常 → `fail_open` 放行 |
 | `hmdp.order.consume` | Counter | `tag` `result` | MQ 消费 CREATE / TIMEOUT 结果 |
+| `hmdp.order.timeout_send_error` | Counter | — | 超时关单延迟消息发送失败（已记入 Redis 重试集合，对账任务重发） |
+| `hmdp.order.dead_letter` | Counter | — | 订单消息超重试上限落入死信 topic（等待对账/人工介入） |
 | `hmdp.cache.rebuild` | Counter | `result` | 缓存异步重建结果 |
 | `hmdp.cache.hit` | Counter | `level`(l1/l2/db) | 多级缓存命中层级分布 |
 
 `reason` 取值封闭在 `SeckillMetrics.Reason` 枚举里：
-`success` / `stock_out` / `repeat` / `rate_limited` / `mq_send_error` / `system_error`。
+`success` / `stock_out` / `repeat` / `rate_limited` / `mq_send_error` / `db_degraded` / `system_error`。
+（`db_degraded` = dbBreaker 打开/半开时入口诚实返回「下单处理中」，P2 落库降级语义。）
 
 ### tag 使用红线
 

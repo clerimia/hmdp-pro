@@ -2,8 +2,12 @@ package com.hmdp.mq;
 
 import cn.hutool.json.JSONUtil;
 import com.hmdp.entity.VoucherOrder;
+import com.hmdp.exception.ErrorCode;
+import com.hmdp.exception.SystemException;
 import com.hmdp.observability.MqTraceCarrier;
 import com.hmdp.utils.RocketMQConstants;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.client.exception.MQBrokerException;
 import org.apache.rocketmq.client.exception.MQClientException;
@@ -65,7 +69,15 @@ public class RocketMQProducer {
 
     /**
      * 发送订单创建事务消息：先半消息，再在 TransactionListener 中执行 Lua，成功则 COMMIT（方案 A）
+     *
+     * <p>P2 容错：{@code mqBreaker} 统计发送失败率（50%/窗口 20/半开 10s）。熔断打开后新请求
+     * 直接被 fallback 语义化拒绝——半消息不再发、本地事务（Lua）不会执行，Redis/DB 一个都不碰，
+     * 这就是「MQ 挂时秒杀快速失败，不打 DB」。
+     *
+     * <p><b>不叠 R4J Retry</b>：client 已有 {@code retryTimesWhenSendFailed=2} 次重试，
+     * 后面还有事务回查 + 对账补单两层兜底，应用层再重试只会放大故障期无效流量（重试风暴）。
      */
+    @CircuitBreaker(name = "mqBreaker", fallbackMethod = "sendOrderCreateInTransactionFallback")
     public SendResult sendOrderCreateInTransaction(VoucherOrder order, SeckillTxContext ctx)
             throws MQClientException {
         Message msg = new Message(
@@ -81,8 +93,25 @@ public class RocketMQProducer {
     }
 
     /**
-     * 发送订单创建普通消息（方案 B：入口已限流并写入 WAITING，库存校验在消费者）
+     * mqBreaker 降级：熔断打开（CallNotPermittedException）时语义化拒绝；
+     * 学习期的真实发送失败原样上抛，交回调用方现有处理路径（fail + 打点）。
      */
+    private SendResult sendOrderCreateInTransactionFallback(VoucherOrder order, SeckillTxContext ctx,
+                                                            Throwable t) throws Exception {
+        if (t instanceof CallNotPermittedException) {
+            log.warn("mqBreaker 熔断打开，事务消息快速失败, orderId={}", order.getId());
+            throw new SystemException(ErrorCode.SYS_MQ_UNAVAILABLE, ErrorCode.SYS_MQ_UNAVAILABLE.getMessage());
+        }
+        if (t instanceof Exception) {
+            throw (Exception) t;
+        }
+        throw new IllegalStateException(t);
+    }
+
+    /**
+     * 发送订单创建普通消息（方案 B 入队 + 对账补单共用）。熔断语义同 {@link #sendOrderCreateInTransaction}。
+     */
+    @CircuitBreaker(name = "mqBreaker", fallbackMethod = "sendOrderCreateFallback")
     public SendResult sendOrderCreate(VoucherOrder order)
             throws MQClientException, MQBrokerException, RemotingException, InterruptedException {
         Message msg = new Message(
@@ -93,6 +122,18 @@ public class RocketMQProducer {
         SendResult result = producer.send(msg);
         log.debug("订单创建消息发送成功(方案B), orderId={}, msgId={}", order.getId(), result.getMsgId());
         return result;
+    }
+
+    /** mqBreaker 降级（普通消息版），行为与事务消息 fallback 一致 */
+    private SendResult sendOrderCreateFallback(VoucherOrder order, Throwable t) throws Exception {
+        if (t instanceof CallNotPermittedException) {
+            log.warn("mqBreaker 熔断打开，普通消息快速失败, orderId={}", order.getId());
+            throw new SystemException(ErrorCode.SYS_MQ_UNAVAILABLE, ErrorCode.SYS_MQ_UNAVAILABLE.getMessage());
+        }
+        if (t instanceof Exception) {
+            throw (Exception) t;
+        }
+        throw new IllegalStateException(t);
     }
 
     /**

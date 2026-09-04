@@ -5,6 +5,7 @@ import com.hmdp.entity.VoucherOrder;
 import com.hmdp.observability.MqTraceCarrier;
 import com.hmdp.observability.TraceContext;
 import com.hmdp.service.IVoucherOrderService;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.client.producer.LocalTransactionState;
 import org.apache.rocketmq.client.producer.TransactionListener;
@@ -24,6 +25,14 @@ public class SeckillTransactionListener implements TransactionListener {
 
     @Resource
     private IVoucherOrderService voucherOrderService;
+
+    /**
+     * dbBreaker 手动引用：回查回调由 RocketMQ producer 内部线程直接调用，
+     * 不经过 Spring 代理，@CircuitBreaker 注解在这里不会生效——只能编程式包裹
+     * （与 ShopServiceImpl 的 dbFallbackBulkhead 同一个坑）。
+     */
+    @Resource
+    private CircuitBreakerRegistry circuitBreakerRegistry;
 
     @Override
     public LocalTransactionState executeLocalTransaction(Message msg, Object arg) {
@@ -58,7 +67,11 @@ public class SeckillTransactionListener implements TransactionListener {
                 log.warn("事务回查消息体缺少 orderId，回滚");
                 return LocalTransactionState.ROLLBACK_MESSAGE;
             }
-            boolean exists = voucherOrderService.hasSeckillTxnMarker(order.getId());
+            // dbBreaker 包裹标记查询（issue #3）：Redis 故障计入熔断统计；
+            // 熔断打开时 executeSupplier 直接抛 CallNotPermittedException，
+            // 走下面的 catch 返回 UNKNOW 等待下次回查，不在故障期反复打 Redis
+            boolean exists = circuitBreakerRegistry.circuitBreaker("dbBreaker")
+                    .executeSupplier(() -> voucherOrderService.hasSeckillTxnMarker(order.getId()));
             if (exists) {
                 log.info("事务回查：标记存在，COMMIT, orderId={}", order.getId());
                 return LocalTransactionState.COMMIT_MESSAGE;

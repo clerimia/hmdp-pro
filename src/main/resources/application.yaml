@@ -94,6 +94,33 @@ resilience4j:
           # 舱壁拒绝 ≠ 依赖故障：隔离层打回的请求不该污染失败率，
           # 否则高峰期限流打满反而会把健康的 redisBreaker 打开
           - io.github.resilience4j.bulkhead.BulkheadFullException
+      # ===== P2：只管 RocketMQ 发送通道（订单创建消息）=====
+      # MQ 抖动不应熔断 Redis（入口 Lua）与 DB（落库），按依赖拆分爆炸半径
+      mqBreaker:
+        failure-rate-threshold: 50
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 20
+        minimum-number-of-calls: 10
+        wait-duration-in-open-state: 10s
+        automatic-transition-from-open-to-half-open-enabled: true
+        permitted-number-of-calls-in-half-open-state: 3
+        ignore-exceptions:
+          - com.hmdp.exception.BusinessException
+        # 注意：不叠 R4J Retry —— client 已有 retryTimesWhenSendFailed=2 次重试，
+        # 后面还有事务回查 + 对账补单两层兜底，应用层再重试就是重试风暴
+      # ===== P2：包裹消费端落库（createOrderFromMQ 注解）与事务回查（编程式）=====
+      # 打开/半开时：消费端快速 RECONSUME_LATER 重投；入口返回 code=ORDER_PROCESSING「处理中」
+      # 而不是谎报成功——Lua 成功只代表 Redis 预扣成功，订单此刻尚未落库
+      dbBreaker:
+        failure-rate-threshold: 50
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 20
+        minimum-number-of-calls: 10
+        wait-duration-in-open-state: 15s
+        automatic-transition-from-open-to-half-open-enabled: true
+        permitted-number-of-calls-in-half-open-state: 3
+        ignore-exceptions:
+          - com.hmdp.exception.BusinessException
   bulkhead:
     instances:
       # 秒杀入口：信号量而非线程池（详见设计文档第 6 节）
