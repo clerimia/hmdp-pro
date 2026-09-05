@@ -2,7 +2,9 @@
 
 > 执行于 2026-09-04 17:35 ~ 18:30（第二轮会话）。
 > 目标：对秒杀 + 入库链路做故障注入，全量排查问题，重点验证**轮询兜底**与**索引**。
-> 支付链路不在范围（按怡霖要求跳过）。
+> 支付链路已明确移除：不接三方支付，券免费领（2026-09-05 决定）。
+> 2026-09-05 支付/关单域删除后，本报告按删除清单（`docs/plans/2026-09-05-payment-domain-deletion-list.md` §4）处置：
+> 删对已删机制的验证、保留并加强「漂移只能靠对账统一重算收敛」的结论、参数类数字标注「改造前基线」。
 
 ---
 
@@ -16,7 +18,7 @@
 | DB 故障 | ⚠️ 降级正确（1100），但轮询会 500 —— **已修复** |
 | Redis 故障 | ⚠️ fail-closed 但返回 401，文案误导 |
 | 自愈能力 | ✅ DB 恢复后约 90 秒全部自动追平 |
-| 对账索引 | ❌ 3 个查询全表扫描 20 万行 —— **已修复** |
+| 对账索引 | ❌ 3 个查询全表扫描 20 万行（其一已随关单域删除）—— **已修复** |
 | 轮询索引 | ✅ 走主键，不需要加 |
 
 **本轮改动**：加 3 个索引（2 张表）、修复轮询 DB 故障期返回 500、新增 `UNKNOWN` 状态。
@@ -29,7 +31,6 @@
 
 `getSeckillResult` 的兜底查询是 `WHERE id = ? AND user_id = ?`，走 `PRIMARY KEY(id)`，`type=const`，无需额外索引。
 
-同理走主键、不需要索引的还有：`payOrder`（id + user_id + status）、`cancelTimeoutOrder`（id + status）。
 走 `uk_user_voucher(user_id, voucher_id)` 的是 LEGACY 档的 `count()` 预查。
 
 ### 1.2 真正缺索引的是对账任务（已修）
@@ -40,24 +41,24 @@
 
 | 对账查询 | 加索引前 | 加索引后 |
 |---|---|---|
-| ①关单兜底 `status=1 AND create_time<?` | `ALL` / 199515 行 | `range` / **1 行** |
-| ②补单 `voucher_id=?` | `index` 全索引扫 uk / 199515 行 | `ref` / **4 行** |
-| ③库存重算 `voucher_id=? AND status IN(1,2)` | `ALL` / 199515 行 | `range` / **3 行** |
+| ①补单 `voucher_id=?` | `index` 全索引扫 uk / 199515 行 | `ref` / **4 行**（可直接沿用：谓词未变，索引降级后前缀查找行为不变） |
+| ②库存重算 `voucher_id=?`（原谓词 `voucher_id=? AND status IN(1,2)`） | `ALL` / 199515 行 | `range` / 3 行（**改造前基线，需在新索引上重测**） |
 
-注意 ② 那个 `type=index` 很有迷惑性：EXPLAIN 显示用了 `uk_user_voucher`，但它是**全索引扫描**而非查找——因为 uk 的最左列是 `user_id`，按 `voucher_id` 查时前缀不匹配，等于把整个索引扫了一遍。
+> 2026-09-05 更新：原「①关单兜底 `status=1 AND create_time<?` → range/1 行」一行已随关单域删除。②库存重算的谓词变为纯 `voucher_id=?`（不再筛状态），索引从 `idx_voucher_status(voucher_id, status)` 降为单列 `idx_voucher(voucher_id)`——①补单的前缀查找行为不变，`ref`/4 行仍是三条实测里唯一可直接沿用的数字；②的 3 行是旧复合索引上的基线，重测需起容器造数，暂缓。
+
+注意 ① 那个 `type=index` 很有迷惑性：EXPLAIN 显示用了 `uk_user_voucher`，但它是**全索引扫描**而非查找——因为 uk 的最左列是 `user_id`，按 `voucher_id` 查时前缀不匹配，等于把整个索引扫了一遍。
 
 **已加索引**（同步进 `db/hmdp-schema.sql`）：
 
 ```sql
--- tb_voucher_order
-INDEX idx_voucher_status    (voucher_id, status)      -- 覆盖 ②③
-INDEX idx_status_create_time (status, create_time)    -- 覆盖 ①
+-- tb_voucher_order（2026-09-05 更新：idx_status_create_time 已随关单兜底查询删除；
+-- idx_voucher_status(voucher_id, status) 已降为单列 idx_voucher(voucher_id)）
+INDEX idx_voucher           (voucher_id)              -- 覆盖 补单/库存重算
 -- tb_seckill_voucher
-INDEX idx_end_time          (end_time)                -- 覆盖 ②③ 的「取已结束券」
+INDEX idx_end_time          (end_time)                -- 覆盖 补单/库存重算 的「取已结束券」
 ```
 
-`idx_voucher_status` 一列两用：③ 用到完整两列，② 只用前缀 `voucher_id`。
-`idx_status_create_time` 的列序不能反——`status` 是等值条件、`create_time` 是范围条件，范围列之后的索引列会失效，等值列必须放前面。
+单列 `idx_voucher` 同时服务补单与库存重算——改造后两个查询的谓词都收敛为 `voucher_id=?` 等值查找。
 
 ---
 
@@ -201,19 +202,21 @@ broker 重启（tmpfs 清空）后，即使重启应用，下单仍报 `No route
 
 本例中手动预建 topic 后恢复（`mqadmin updateTopic -b broker-a -t order-seckill-topic`）。**生产环境必须预建 topic，不能依赖自动创建**。
 
-### 3.8 超时关单兜底（意外触发）✅
+### 3.8 超时关单兜底（意外触发）——存量漂移结论（改造后仍成立）
 
-混沌测试持续超过 15 分钟，`closeTimeoutOrders` 兜底被触发，批量关闭超时未支付订单并回补库存——**关单链路工作正常**。
+> 2026-09-05 改造注记：`closeTimeoutOrders` 兜底已随关单域整体删除，本节对关单链路本身的验证随之失效；但**它暴露的存量漂移问题在改造后仍然存在**（MQ 丢单照样造成 `redis_stock` 与 `db_stock` 不一致），结论反而升级——见本节末。
 
-但暴露了一个现象：**关单回补不修正存量漂移**。
+混沌测试持续超过 15 分钟，`closeTimeoutOrders` 兜底被触发，批量关闭超时未支付订单并回补库存，暴露了一个现象：**增量回补不修正存量漂移**。
 
-券 13 目前 `redis_stock=48 / db_stock=50`（差 2），正是此前 broker 重启丢的 2 单造成。关单回补是「各回各的」（Redis +1、DB +1），不会抹平这个差值。漂移会一直存在，直到活动结束后 `reconcileFinishedStocks` 按订单账本统一重算。
+券 13 当时 `redis_stock=48 / db_stock=50`（差 2），正是此前 broker 重启丢的 2 单造成。回补是「各回各的」（Redis +1、DB +1），不会抹平这个差值。
+
+**结论（改造后从「接受一个缺陷」变为「这就是唯一设计」）：存量漂移没有任何增量修正路径——关单回补这半个补救也已删除——只能等活动结束后由 `reconcileFinishedStocks` 按订单账本统一重算。对账统一重算是唯一纠偏路径。**
 
 ---
 
 ## 3.9 对账任务专项审计（怡霖问的重点）
 
-先说结论：**对账的核心兜底能力是好的**——补单、关单、库存重算三条链路实测都能把账本收敛到正确值。但审计 + 实测发现 2 个必须修的问题（已修）和 4 个规模问题（未修）。
+先说结论：**对账的核心兜底能力是好的**——补单、库存重算两条链路实测都能把账本收敛到正确值。但审计 + 实测发现 2 个必须修的问题（当时已修）和 4 个规模问题（处置见下表，2026-09-05 更新：2 个已在对账改造中修复，2 个随关单域删除消失）。
 
 ### 已修 ①补单与重算的时序竞态（实测证实，危害明确）
 
@@ -229,20 +232,24 @@ broker 重启（tmpfs 清空）后，即使重启应用，下单仍报 `No route
 
 修复：补单返回「本轮是否补过」，补过就跳过本轮重算，下轮账本稳定后再算。**对账本是每轮收敛的，晚一轮没有代价，算错数才有。**
 
+> 改造注记（2026-09-05）：补单已改为同步直调 `createOrderFromMQ`（不走 MQ），但这条时序陷阱**升级为规格**仍然成立且更隐蔽——补单结果三态中 SUPPLEMENTED 与异常都跳过重算；`expected` 公式变简单（不筛 `used`）后，更容易想当然地认为「补完马上算也没事」。实测对照表是本条规格的实证依据，作为事实保留。
+
 ### 已修 ②一个步骤异常导致后续全部跳过
 
 原先四步共用一个 `try`，任何一步抛异常后面全部停摆。对账的价值在于「兜底」，一个兜底挂了就让其余三个一起失效，等于把兜底做成了单点。已改为每步独立 `try-catch`，失败只跳过该步。
 
-### 未修：4 个规模问题（当前数据量下不暴露，生产会）
+> 改造注记（2026-09-05）：此处「四步」为改造前口径（含关单与在途守卫）；支付/关单域删除后对账为两步（补单、库存重算），分步容错的 `runStep` 结构不变。
 
-| # | 问题 | 后果 | 建议 |
-|---|---|---|---|
-| 1 | `closeTimeoutOrders` 用 `.list()` 全量拉超时订单，无分页无 LIMIT | 超时订单量大时 OOM | 按 create_time 分批，每批 500 条 |
-| 2 | `SMEMBERS seckill:order:{voucherId}` 一次性取全部成员 | 热门券（10 万人）会**阻塞 Redis 单线程** | 改 `SSCAN` 分批 |
-| 3 | 补单与重算都用 `lt(endTime, now)` 遍历**所有**历史结束券，无时间下限 | 随运营增长每轮越来越慢 | 加时间下界，只扫最近 N 天结束的券 |
-| 4 | `seckill:timeout:retry` 集合无 TTL、无清理 | 订单不存在时该 orderId 永远重发 | 加最大重试次数，超限丢弃并告警 |
+### 规模问题处置（原「未修：4 个规模问题」，2026-09-05 更新）
 
-另注：`supplementMissingOrders` 用 `lt(endTime, now)`、`reconcileFinishedStocks` 用 `lt(endTime, now-2min)`，两个阈值不一致。这本身是合理设计（重算多等 2 分钟让队列排空），但意味着**结束后 0~2 分钟内补单会跑而重算不跑**，此窗口内补单可能把「只是延迟、没真丢」的单再补一次——靠 `uk_user_voucher` 拦截，安全但产生无效 MQ 流量与错误日志。
+| 原# | 问题 | 处置 |
+|---|---|---|
+| 1 | `closeTimeoutOrders` 用 `.list()` 全量拉超时订单，无分页无 LIMIT（超时订单量大时 OOM） | **随方法删除消失**（关单域整体删除） |
+| 2 | `SMEMBERS seckill:order:{voucherId}` 一次性取全部成员（热门券 10 万人会阻塞 Redis 单线程） | **已修**（2026-09-05 对账改造：SSCAN 游标 + COUNT 提示 500 + 单轮补单上限 100，剩余差集下轮继续） |
+| 3 | 补单与重算都用 `lt(endTime, now)` 遍历**所有**历史结束券，无时间下限（随运营增长每轮越来越慢） | **已修**（`RECONCILE_WINDOW_DAYS = 7`，只扫最近 7 天结束的券，key 续期 14 天后自然过期） |
+| 4 | `seckill:timeout:retry` 集合无 TTL、无清理（订单不存在时该 orderId 永远重发） | **随机制删除消失**（`seckill:timeout:retry` 机制已于 2026-09-05 前整体删除） |
+
+另注（2026-09-05 已过期修正）：原文记载「补单用 `lt(endTime, now)`、重算用 `lt(endTime, now-2min)`，两个阈值不一致——结束后 0~2 分钟内补单会跑而重算不跑，可能把只是延迟的单再补一次」。现已统一为同一常量 `RECONCILE_AFTER_END_MINUTES`（8 分钟，推导见 `SeckillReconcileTask:76`），且补过单或补单异常时本轮直接跳过重算，该窗口与风险都不复存在。
 
 ## 4. 问题清单
 
@@ -250,7 +257,7 @@ broker 重启（tmpfs 清空）后，即使重启应用，下单仍报 `No route
 
 | # | 问题 | 修复 |
 |---|---|---|
-| 1 | 对账 3 个查询全表扫描 20 万行 | 加 `idx_voucher_status` / `idx_status_create_time` / `idx_end_time`，同步进 schema.sql |
+| 1 | 对账 3 个查询全表扫描 20 万行 | 加 `idx_voucher_status` / `idx_status_create_time` / `idx_end_time`，同步进 schema.sql（2026-09-05 更新：前两者已变为单列 `idx_voucher` / 已随关单域删除） |
 | 2 | DB 故障期轮询抛 500 | 改为返回 `UNKNOWN`（200），前端可继续轮询 |
 | 3 | broker 启动后数秒退出 253（tmpfs 属主 root 写不进） | tmpfs 显式指定 `uid=3000,gid=3000` |
 | 4 | 对账：补单与重算同轮执行，把 Redis 库存调大（实测多出 1 份、持续 60s） | 补单后跳过本轮重算 |
@@ -261,8 +268,8 @@ broker 重启（tmpfs 清空）后，即使重启应用，下单仍报 `No route
 | # | 问题 | 影响 | 建议 |
 |---|---|---|---|
 | 4 | Redis 故障时返回 401 | 文案误导，掩盖真实故障 | 拦截器区分「无 token」与「Redis 不可用」，后者返回 503 |
-| 5 | 进行中券丢单无人兜底 | 库存凭空蒸发（券 13 实测少 2 份） | 补单时只补订单、不回补库存（回补即超卖） |
-| 6 | 关单回补不修正存量漂移 | 漂移持续到活动结束 | 接受现状，由 `reconcileFinishedStocks` 收敛 |
+| 5 | 进行中券丢单无人兜底 | **用户永久失去这张券且当下无法自愈**，连带库存数字凭空蒸发（券 13 实测少 2 份）——关单删除后无增量补救，优先级上升 | 补单时只补订单、不回补库存（回补即超卖） |
+| 6 | 存量漂移无增量修正路径 | 漂移持续到活动结束——**这不是「接受的缺陷」，是唯一设计**：对账统一重算是唯一纠偏路径（见 §3.8） | —（按设计收敛） |
 | 7 | `NOT_FOUND` 语义三义 | 极端情况用户误以为失败 | 与 #5 一并解决 |
 | 8 | dbBreaker 学习期（10 次）内下单报成功 | 故障最初几秒的乐观返回 | 接受，已有重试 + 对账兜底 |
 | 9 | 事务消息不触发 topic 自动创建 | broker 重启后下单全挂，且重启应用无效 | 预建 topic（`mqadmin updateTopic`）或应用启动时用 `MQAdminExt` 确保存在 |
