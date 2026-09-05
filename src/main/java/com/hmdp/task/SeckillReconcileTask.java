@@ -91,13 +91,6 @@ public class SeckillReconcileTask {
     /** SSCAN 每次网络往返的 COUNT 提示（Redis 侧的批量提示，非精确批量大小） */
     private static final int SSCAN_COUNT_HINT = 500;
 
-    // —— 指标 tag 合法取值（口径契约见 ReconcileMetrics 类注释）——
-    private static final String OUTCOME_COMPLETED = "completed";
-    private static final String OUTCOME_SKIPPED_SUPPLEMENT = "skipped_supplement";
-    private static final String OUTCOME_SKIPPED_LOCK = "skipped_lock";
-    private static final String STEP_SUPPLEMENT = "supplement";
-    private static final String STEP_RESTOCK = "restock";
-
     /**
      * 补单步骤的三态结果。不用 Boolean 三态（TRUE/FALSE/null）——语义只能靠注释
      * 维系的东西就是隐患，枚举把语义写进类型。ERROR 态由 {@link #runStep} 捕获
@@ -128,24 +121,24 @@ public class SeckillReconcileTask {
         if (!locked) {
             // 这个分支曾经整个方法静默 return——多实例下「对账没跑」与「跑了但没事」
             // 完全无法区分。round{outcome=skipped_lock} 让它可观测、可断言。
-            reconcileMetrics.round(OUTCOME_SKIPPED_LOCK);
+            reconcileMetrics.round(ReconcileMetrics.OUTCOME_SKIPPED_LOCK);
             return;
         }
         try {
-            StepResult supplemented = runStep(STEP_SUPPLEMENT, this::supplementMissingOrders);
+            StepResult supplemented = runStep(ReconcileMetrics.STEP_SUPPLEMENT, this::supplementMissingOrders);
             if (supplemented == StepResult.CLEAN) {
-                runStep(STEP_RESTOCK, () -> {
+                runStep(ReconcileMetrics.STEP_RESTOCK, () -> {
                     reconcileFinishedStocks();
                     return StepResult.CLEAN;
                 });
-                reconcileMetrics.round(OUTCOME_COMPLETED);
+                reconcileMetrics.round(ReconcileMetrics.OUTCOME_COMPLETED);
             } else {
                 // 补过单（SUPPLEMENTED）或异常（null）都跳过重算：补单结果不确定就跳过——
                 // 补单半途中断时 COUNT 比真实账本少几笔，expected 会算大、凭空多放库存。
                 // 晚算没有代价，算错才有。
                 log.warn("对账：本轮补单结果不确定（{}），跳过库存重算，下轮再算",
                         supplemented == StepResult.SUPPLEMENTED ? "发生过补单" : "步骤异常");
-                reconcileMetrics.round(OUTCOME_SKIPPED_SUPPLEMENT);
+                reconcileMetrics.round(ReconcileMetrics.OUTCOME_SKIPPED_SUPPLEMENT);
             }
         } finally {
             if (lock.isHeldByCurrentThread()) {

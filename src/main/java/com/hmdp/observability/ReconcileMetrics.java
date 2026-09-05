@@ -34,6 +34,18 @@ public class ReconcileMetrics {
     public static final String RECONCILE_SUPPLEMENT = "hmdp.reconcile.supplement";
     public static final String RECONCILE_RESTOCK = "hmdp.reconcile.restock";
 
+    // —— tag 合法取值（与指标名一起收口在门面类，调用方不得自造字符串）——
+    /** round 的 outcome：两步都尝试执行（步骤级成败看 step 指标，执行≠成功） */
+    public static final String OUTCOME_COMPLETED = "completed";
+    /** round 的 outcome：补过单或补单步骤异常，本轮跳过了库存重算 */
+    public static final String OUTCOME_SKIPPED_SUPPLEMENT = "skipped_supplement";
+    /** round 的 outcome：分布式锁抢锁失败，本轮没有执行 */
+    public static final String OUTCOME_SKIPPED_LOCK = "skipped_lock";
+    /** step 的取值：补单 */
+    public static final String STEP_SUPPLEMENT = "supplement";
+    /** step 的取值：库存重算 */
+    public static final String STEP_RESTOCK = "restock";
+
     private final ObservabilityRecorder recorder;
 
     public ReconcileMetrics(ObservabilityRecorder recorder) {
