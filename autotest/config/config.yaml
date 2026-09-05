@@ -1,0 +1,25 @@
+# 环境无关默认值（可被 env.<profile>.yaml / 环境变量 ${HMDP_*} / 命令行 --base-url 覆盖）
+http:
+  timeout: 5.0              # 单请求超时（秒）
+
+wait:
+  default_timeout: 5.0      # wait_until 默认超时（秒）
+  interval: 0.2             # 轮询步长（秒）
+
+# 动态造号号段：138001 + 5 位序号 → 13800100000 起。
+# 手机号合法（130-139 段）、后端自动注册，无需预置 SQL。
+phone:
+  prefix: "138001"
+  start: 0
+  width: 5
+
+# 默认单用户：种子用户 1「小鱼同学」（hmdp-seed-data.sql，id=1）。
+# 注意与 phone 号段区分——种子用户是预置数据，phone_pool 是动态注册用户。
+user:
+  default_phone: "13800000001"
+
+seckill:
+  stock_default: 100        # new_seckill_voucher 默认库存
+
+metrics:
+  application: "hmdp-pro"   # Prometheus 全局 tag（application.yaml: management.metrics.tags.application）

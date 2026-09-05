@@ -1,0 +1,15 @@
+# 运行
+pytest>=8.3
+pytest-html>=4.1            # 本地快查报告
+allure-pytest>=2.13         # 正式报告（需另装 allure CLI 才能出 HTML）
+pytest-rerunfailures>=14.0  # 仅用于网络抖动兜底，见 pytest.ini 红线说明
+requests>=2.32
+PyMySQL>=1.1
+redis>=5.0
+PyYAML>=6.0
+
+# 可选
+pytest-xdist>=3.6           # 独立用例加速；serial/chaos 标记用例自动排除
+
+# 红线：不引 tenacity——wait_until 自己写 20 行，少一个依赖。
+# Playwright 依赖单独放 ui/requirements-ui.txt，不混进主依赖。

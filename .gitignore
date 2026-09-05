@@ -58,3 +58,12 @@ hm-dianping-frontend/nginx.exe
 hm-dianping-frontend/html/index.html
 hm-dianping-frontend/html/50x.html
 hm-dianping-frontend/html/hmdp/imgs/
+
+### Python 接口自动化（autotest/，见 docs/plans/2026-09-05-pytest-framework-structure.md §6）###
+autotest/.venv/
+autotest/reports/*
+!autotest/reports/.gitkeep
+autotest/allure-results/
+autotest/.pytest_cache/
+__pycache__/
+*.py[cod]

@@ -1,0 +1,3 @@
+# Playwright 依赖（执行 UI 票时装，不混进主 requirements.txt）
+# playwright>=1.49
+# 安装后还需: playwright install chromium

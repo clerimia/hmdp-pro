@@ -1,0 +1,10 @@
+# 登录链路用例数据（执行⑥票填充；结构约定见 common/data_loader.py）。
+# 用例清单见 docs/plans/2026-09-05-login-chain-test-strategy.md §3（23 条）。
+# 示例条目（填充时参照）：
+# - id: TC-S02
+#   phone: ""
+#   expect:
+#     http_status: 200
+#     success: false
+#     msg_contains: "手机号格式错误"
+[]
