@@ -159,6 +159,18 @@ PromQL 速查：
 | 每分钟降级拒流量 | `sum(increase(hmdp_resilience_breaker_event_total{kind="not_permitted"}[1m])) by (breaker)` |
 | 每分钟秒杀降级量 | `sum(increase(hmdp_seckill_degraded_total[1m])) by (breaker, reason)` |
 
+4. **死信告警（Grafana Unified Alerting，provisioning 自动加载）**：
+   `docker/grafana/provisioning/alerting/hmdp-alerting.yml` 定义一条规则——
+   `sum(increase(hmdp_order_dead_letter_total[5m])) or vector(0) > 0` 即 Firing。
+   立场：死信量健康态恒为 0，业务侧对账分钟级兜底，告警只负责「让放弃被看见」。
+   `or vector(0)` 是必须的：Micrometer Counter 首次打点前指标不存在，不补 0 规则永远停在 NoData。
+   通知走 SMTP 邮件（Grafana 原生支持，无需转发中间件）：发件配置在
+   `docker-compose.yml` 的 `GF_SMTP_*` 环境变量（QQ 邮箱 465/SSL 示例，163/Gmail 见注释），
+   收件人在 alerting yml 的 `addresses`。两处占位符 `REPLACE_ME` 替换后才真正发信；
+   未替换时规则照常评估，Grafana UI（Alerting → Alert rules）照常显示状态，仅发信失败。
+   要换钉钉/企微 webhook：改 alerting yml 里注释掉的 webhook 联系点
+   （群机器人不认 Grafana 默认 JSON 格式，需自建转发端）。
+
 ## 8. 已知取舍
 
 - **没有 span 树**：本方案只做 traceId 串联，没有父子 span 和耗时瀑布图。
