@@ -38,8 +38,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import javax.annotation.Resource;
-import java.time.Duration;
-import java.time.LocalDateTime;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
@@ -84,9 +82,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private CircuitBreakerRegistry circuitBreakerRegistry;
 
     /**
-     * 落库事务模板。用模板而不是 {@code @Transactional} 注解，是因为本方法还要在
-     * 事务提交之后发 MQ 延迟消息——注解只能包住整个方法，会把「发消息」也卷进事务，
-     * 而 MQ 不是事务资源，回滚时消息撤不回来。
+     * 落库事务模板。用模板而不是 {@code @Transactional} 注解，是因为 insert 与扣库存
+     * 必须同生共死（见 {@link #createOrderFromMQ}）——注解包住整个方法会把方法内
+     * 非事务的旁路操作也卷进事务语义里，模板把事务边界收到最小。
      */
     @Resource
     private TransactionTemplate transactionTemplate;
@@ -94,8 +92,6 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
     /** 对比测试：只扣库存、不做 Lua 一人一单（EARLY 档位） */
     private static final DefaultRedisScript<Long> SECKILL_STOCK_ONLY_SCRIPT;
-    /** 取消订单回补 Redis 库存（SETNX 幂等标记 + 条件 incr，同脚本原子） */
-    private static final DefaultRedisScript<Long> RESTORE_STOCK_SCRIPT;
 
     /**
      * Redis 开关：seckill:test:protection = FULL|LEGACY|EARLY（默认 FULL）
@@ -121,10 +117,6 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         SECKILL_STOCK_ONLY_SCRIPT = new DefaultRedisScript<>();
         SECKILL_STOCK_ONLY_SCRIPT.setLocation(new ClassPathResource("seckill-stock-only.lua"));
         SECKILL_STOCK_ONLY_SCRIPT.setResultType(Long.class);
-
-        RESTORE_STOCK_SCRIPT = new DefaultRedisScript<>();
-        RESTORE_STOCK_SCRIPT.setLocation(new ClassPathResource("seckill-restore-stock.lua"));
-        RESTORE_STOCK_SCRIPT.setResultType(Long.class);
     }
 
     /**
@@ -167,118 +159,6 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             log.warn("档位开关读取失败，沿用上一快照 {}（3s 缓存语义）", snapshot.mode, e);
             return snapshot.mode;
         }
-    }
-
-    /**
-     * 取消超时订单并回补库存：由 RocketMQ 延迟消息触发，对账兜底扫描也会调用。
-     *
-     * <p><b>幂等设计（按资源拆分标记，而非单一状态 CAS）</b>：状态 CAS（1→4）只保证
-     * 「不重复关单」，不保证「不重复回补」——原实现 CAS 后 incr/DB +1 抛异常，消息重投时
-     * status 已是 4 被短路 return，这份库存就永久丢了（活动期间少卖）。
-     *
-     * <p>回补分两个半边、各自幂等：
-     * <ul>
-     *   <li><b>Redis 半边</b>：seckill-restore-stock.lua——SETNX 标记与条件 incr 同脚本
-     *   原子执行，天然 exactly-once（客户端超时不知脚本是否执行过也没关系，重试 SETNX
-     *   失败即跳过）。脚本异常直接上抛重投，不删标记。</li>
-     *   <li><b>DB 半边</b>：独立标记 seckill:restore:db:{orderId}，SETNX 成功者执行
-     *   stock+1；仅 DB 更新异常时 DELETE 标记再上抛，重投只重做 DB 半边。</li>
-     * </ul>
-     *
-     * <p><b>为何不用单标记 + 异常时删除重做</b>：若 Redis incr 成功后 DB 抛异常，删标记
-     * 重投会把 Redis 半边也重做 → Redis 库存 +2 → 额外用户过闸 → <b>超卖</b>。本项目第一
-     * 不变量是「永不过补优先于尽量不丢补」：丢补是少卖（方向安全，由活动结束对账收敛），
-     * 过补直接击穿入口闸门。拆分后任何路径都不会重做已成功的半边。
-     *
-     * <p>已知接受的边界（均为窄崩溃窗口，方向安全）：DB 标记 SETNX 后、UPDATE 前进程死亡
-     * → 少补 1，活动结束对账收敛；UPDATE 已提交但客户端视为异常 → 重投 DB 再 +1，仅 DB
-     * 显示漂移（入口闸门是 Redis，不会超卖），出窗对账修正。
-     *
-     * <p>注意：本方法不做 seckill:order 集合的 srem——「一人一次机会」是有意设计
-     * （防占位/防黄牛），取消只回补库存给别人买，本人不能再抢。
-     */
-    public void cancelTimeoutOrder(Long orderId) {
-        VoucherOrder order = getById(orderId);
-        if (order == null || order.getStatus() == null) {
-            return;
-        }
-        if (order.getStatus() == ORDER_STATUS_UNPAID) {
-            // 首次关单：CAS 1→4。失败 = 并发支付或并发关单者已处理，交由对方完成回补
-            boolean updated = update()
-                    .set("status", ORDER_STATUS_CANCELLED)
-                    .eq("id", orderId)
-                    .eq("status", ORDER_STATUS_UNPAID)
-                    .update();
-            if (!updated) {
-                return;
-            }
-        } else if (order.getStatus() != ORDER_STATUS_CANCELLED) {
-            // 已支付/核销/退款链路，不关不补
-            return;
-        }
-        // 走到这里 status 必为 CANCELLED：要么是刚 CAS 成功的首关线程，
-        // 要么是回补中途失败后的重投线程——两个半边各自 SETNX 串行，谁拿到谁干活。
-
-        // ① Redis 回补：Lua 原子（SETNX 标记 + 条件 incr）。异常直接上抛重投，
-        //    不删任何标记（脚本原子性自管，重投 SETNX 失败即跳过）
-        Long restored = stringRedisTemplate.execute(
-                RESTORE_STOCK_SCRIPT,
-                Collections.emptyList(),
-                orderId.toString(),
-                order.getVoucherId().toString(),
-                String.valueOf(SECKILL_RESTORE_TTL_SECONDS));
-        log.info("订单 {} 取消回补 Redis 库存：{}", orderId,
-                restored != null && restored == 1L ? "本次执行" : "已执行过（幂等跳过）");
-
-        // ② DB 回补：独立标记。仅 DB 更新异常时删除标记再上抛，重投只重做这一半边
-        Boolean dbMarked = stringRedisTemplate.opsForValue().setIfAbsent(
-                SECKILL_RESTORE_DB_KEY + orderId, "1", Duration.ofSeconds(SECKILL_RESTORE_TTL_SECONDS));
-        if (Boolean.TRUE.equals(dbMarked)) {
-            try {
-                seckillVoucherService.update()
-                        .setSql("stock = stock + 1")
-                        .eq("voucher_id", order.getVoucherId())
-                        .update();
-            } catch (Exception e) {
-                // 回滚幂等闸门让重投重做 DB 半边；Redis 半边已原子完成，不会被重做
-                stringRedisTemplate.delete(SECKILL_RESTORE_DB_KEY + orderId);
-                throw e;
-            }
-        }
-        log.info("订单 {} 超时未支付，已取消并回补库存，券 {}", orderId, order.getVoucherId());
-    }
-
-    @Override
-    public Result payOrder(Long orderId) {
-        UserDTO user = UserHolder.getUser();
-        if (user == null) {
-            return Result.fail(ErrorCode.LOGIN_REQUIRED);
-        }
-        // 模拟支付：仅当订单未支付时改为已支付。
-        //
-        // user_id 必须作为更新条件，不能只按 orderId 更新：否则任何登录用户只要拿到
-        // 别人的 orderId，就能把别人的订单改成「已支付」——典型的 IDOR 越权。
-        // 订单号虽由 UidGenerator 生成不可枚举，但秒杀接口会把它返回给下单者、
-        // 前端还会明文展示，一旦从日志/截图/录屏泄漏出去就够用了。
-        // 把归属判断下沉为 SQL 条件而不是「先查再比对」，是为了让它和状态判断
-        // 一起构成原子 CAS，不存在 check-then-act 的竞态窗口。
-        boolean updated = update()
-                .set("status", ORDER_STATUS_PAID)
-                .set("pay_time", LocalDateTime.now())
-                .eq("id", orderId)
-                .eq("user_id", user.getId())
-                .eq("status", ORDER_STATUS_UNPAID)
-                .update();
-        if (!updated) {
-            // 不区分「订单不存在 / 不是你的订单 / 状态不允许」——
-            // 统一文案可以避免攻击者用错误信息的差异来枚举订单号是否存在。
-            // 排查所需的区分信息记在日志里，不外泄给调用方。
-            log.warn("支付未生效（订单不存在、非本人或状态不允许）, orderId={}, userId={}",
-                    orderId, user.getId());
-            return Result.fail("订单不存在或状态不允许支付");
-        }
-        // 延迟关单消息不可撤销，到点后 cancelTimeoutOrder 通过状态乐观更新自动跳过已支付订单，无需额外处理
-        return Result.ok("支付成功");
     }
 
     /**
@@ -344,10 +224,10 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             // 事务内：insert（靠主键去重）→ 扣 DB 库存，两者同生共死。
             // 这样既消除了「扣了库存但 insert 前进程崩溃」造成的少卖，
             // 也让库存不足时刚 insert 的订单一并回滚，不留无库存支撑的脏单。
+            // used 不写这一列，靠 DB 默认 0——「创建一行 = 已领取」，杜绝落库时误写 1。
             Boolean stockOk;
             try {
                 stockOk = transactionTemplate.execute(status -> {
-                    voucherOrder.setStatus(ORDER_STATUS_UNPAID);
                     save(voucherOrder);
                     boolean ok = seckillVoucherService.update()
                             .setSql("stock = stock - 1")
@@ -375,17 +255,6 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 return;
             }
 
-            // 事务已提交才发延迟关单消息：MQ 不是事务资源，放进事务里的话
-            // 回滚时消息撤不回来，会留下指向不存在订单的关单消息。
-            try {
-                rocketMQProducer.sendOrderTimeout(orderId);
-            } catch (Exception e) {
-                // 发送失败无需额外补偿：对账任务按 createTime 扫描超时未支付订单直接关单，
-                // 不依赖这条消息到达（延迟同分布 15~16 分钟）。指标保留——发送失败
-                // 是 MQ 健康的观测信号。
-                seckillMetrics.orderTimeoutSendError();
-                log.error("超时关单延迟消息发送失败（由对账关单兜底）, orderId={}", orderId, e);
-            }
             writeQueueStatusSafe(orderId, SeckillMode.QUEUE_SUCCESS);
         } catch (RuntimeException e) {
             throw e;
@@ -584,7 +453,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
         if (order != null) {
             data.put("status", SeckillMode.QUEUE_SUCCESS);
-            data.put("orderStatus", order.getStatus());
+            data.put("used", order.getUsed());
             return Result.ok(data);
         }
 

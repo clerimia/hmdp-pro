@@ -45,21 +45,16 @@ seckill:
   rate-limit:
     sliding-window:
       enabled: true
-      # 下单动作：严格，挡连点与脚本
+      # 领券动作：严格，挡连点与脚本
       window-ms: 1000      # 窗口 1 秒
-      max-requests: 5      # 同一用户窗口内最多 5 次秒杀请求
-      # 结果查询（轮询）：单独配额，与下单互不占用（共用一个 key 会让前端
-      # 多查几次结果就烧光自己的下单额度）。
+      max-requests: 5      # 同一用户窗口内最多 5 次领券请求
+      # 结果查询（轮询）：单独配额，与领券互不占用（共用一个 key 会让前端
+      # 多查几次结果就烧光自己的领券额度）。
       # 注意轮询规模本身被库存数封顶——只有抢到的人才有 orderId 可查，
       # 不存在「几十万人同时轮询」。这道限流真正防的是伪造 orderId 反复查询、
       # 打穿排队状态缓存直落 DB（见 VoucherOrderServiceImpl#getSeckillResult）。
       result-window-ms: 1000
       result-max-requests: 10
-      # 支付结果查询（轮询是否支付成功）：同样单独配额。
-      # 与落库查询分开是因为两者生命周期不同——落库秒级收敛，
-      # 支付要等到 15 分钟关单窗口，共用会互相干扰。
-      pay-window-ms: 1000
-      pay-max-requests: 10
 
 # ===== 百度 UidGenerator（订单号生成，见 UidGeneratorConfig）=====
 # 位分配: sign(1) + time(28) + worker(22) + seq(13) = 63bit

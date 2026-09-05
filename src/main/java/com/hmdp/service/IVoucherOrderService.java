@@ -16,11 +16,6 @@ public interface IVoucherOrderService extends IService<VoucherOrder> {
 
     Result seckillVoucher(Long voucherId);
 
-    Result payOrder(Long orderId);
-
-    /** 取消超时未支付订单（RocketMQ 延迟消息触发，回补库存） */
-    void cancelTimeoutOrder(Long orderId);
-
     /** MQ 异步落库创建订单（幂等） */
     void createOrderFromMQ(VoucherOrder voucherOrder);
 
@@ -35,7 +30,7 @@ public interface IVoucherOrderService extends IService<VoucherOrder> {
 
     /**
      * 查询秒杀异步结果（方案 B 为主；方案 A 成功时无排队状态，可查订单表兜底）
-     * @return data 含 orderId、status（WAITING/SUCCESS/FAIL_*）
+     * @return data 含 orderId、status（WAITING/SUCCESS/FAIL_*）、used（0=已领取未使用/1=已使用）
      */
     Result getSeckillResult(Long orderId);
 }

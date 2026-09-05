@@ -157,7 +157,7 @@
       "id": 6,
       "type": "timeseries",
       "title": "MQ 消费结果（按 tag / result）",
-      "description": "tag=CREATE（下单落库）/ TIMEOUT（超时关单）；error 持续上涨要查消费者",
+      "description": "tag=CREATE（领券落库）；error 持续上涨要查消费者",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
       "datasource": { "type": "prometheus", "uid": "hmdp-prom" },
       "targets": [

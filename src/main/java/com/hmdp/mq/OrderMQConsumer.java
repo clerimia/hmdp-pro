@@ -31,7 +31,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * 秒杀订单消费者：消费 CREATE（异步落库）与 TIMEOUT（超时关单）消息
+ * 秒杀订单消费者：消费 CREATE（异步落库）消息
  * 消费失败返回 RECONSUME_LATER，由 RocketMQ 按重试间隔自动重投，配合业务幂等保证不丢单
  *
  * <p>P2 容错：
@@ -102,7 +102,7 @@ public class OrderMQConsumer {
         // 消费回调线程只做「提交任务 + 等待结果」，4 个足够；业务并发由独立池决定
         consumer.setConsumeThreadMin(4);
         consumer.setConsumeThreadMax(4);
-        consumer.subscribe(RocketMQConstants.ORDER_TOPIC, "CREATE || TIMEOUT");
+        consumer.subscribe(RocketMQConstants.ORDER_TOPIC, RocketMQConstants.ORDER_TAG_CREATE);
         consumer.registerMessageListener((MessageListenerConcurrently) (msgs, context) -> {
             List<Future<Boolean>> futures = new ArrayList<>(msgs.size());
             try {
@@ -132,7 +132,7 @@ public class OrderMQConsumer {
             return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
         });
         consumer.start();
-        log.info("RocketMQ 消费者启动成功，订阅 {}/CREATE || TIMEOUT，重试上限={} 次，业务线程池 core={} max={} queue=100",
+        log.info("RocketMQ 消费者启动成功，订阅 {}/CREATE，重试上限={} 次，业务线程池 core={} max={} queue=100",
                 RocketMQConstants.ORDER_TOPIC, MAX_RECONSUME_TIMES, 8, 16);
     }
 
@@ -168,8 +168,6 @@ public class OrderMQConsumer {
             if (RocketMQConstants.ORDER_TAG_CREATE.equals(tag)) {
                 VoucherOrder order = JSONUtil.toBean(body, VoucherOrder.class);
                 voucherOrderService.createOrderFromMQ(order);
-            } else if (RocketMQConstants.ORDER_TAG_TIMEOUT.equals(tag)) {
-                voucherOrderService.cancelTimeoutOrder(Long.valueOf(body));
             } else {
                 log.warn("未知消息 Tag: {}", tag);
             }

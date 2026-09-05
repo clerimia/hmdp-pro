@@ -29,7 +29,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * RocketMQ 生产者：秒杀订单事务消息（CREATE）+ 超时关单延迟消息（TIMEOUT）
+ * RocketMQ 生产者：秒杀订单事务消息（CREATE）
  */
 @Slf4j
 @Component
@@ -119,7 +119,7 @@ public class RocketMQProducer {
     }
 
     /**
-     * 发送订单创建普通消息（方案 B 入队 + 对账补单共用）。熔断语义同 {@link #sendOrderCreateInTransaction}。
+     * 发送订单创建普通消息（对账补单用）。熔断语义同 {@link #sendOrderCreateInTransaction}。
      */
     @CircuitBreaker(name = "mqBreaker", fallbackMethod = "sendOrderCreateFallback")
     public SendResult sendOrderCreate(VoucherOrder order)
@@ -147,22 +147,6 @@ public class RocketMQProducer {
             throw (Exception) t;
         }
         throw new IllegalStateException(t);
-    }
-
-    /**
-     * 发送超时关单延迟消息（broker 按档位延迟投递，到点触发关单）
-     */
-    public void sendOrderTimeout(Long orderId)
-            throws MQClientException, MQBrokerException, RemotingException, InterruptedException {
-        Message msg = new Message(
-                RocketMQConstants.ORDER_TOPIC,
-                RocketMQConstants.ORDER_TAG_TIMEOUT,
-                orderId.toString().getBytes(StandardCharsets.UTF_8));
-        msg.setDelayTimeLevel(RocketMQConstants.ORDER_TIMEOUT_DELAY_LEVEL);
-        MqTraceCarrier.inject(msg);
-        producer.send(msg);
-        log.debug("超时关单延迟消息发送成功, orderId={}, delayLevel={}",
-                orderId, RocketMQConstants.ORDER_TIMEOUT_DELAY_LEVEL);
     }
 
     @PreDestroy

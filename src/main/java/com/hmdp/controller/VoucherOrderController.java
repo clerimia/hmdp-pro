@@ -6,7 +6,6 @@ import com.hmdp.service.IVoucherOrderService;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -38,13 +37,5 @@ public class VoucherOrderController {
     @GetMapping("seckill/result/{orderId}")
     public Result seckillResult(@PathVariable("orderId") Long orderId) {
         return voucherOrderService.getSeckillResult(orderId);
-    }
-
-    /**
-     * 模拟支付
-     */
-    @PutMapping("pay/{id}")
-    public Result payOrder(@PathVariable("id") Long orderId) {
-        return voucherOrderService.payOrder(orderId);
     }
 }

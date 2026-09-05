@@ -28,9 +28,12 @@ import java.util.stream.Collectors;
 
 /**
  * 秒杀对账任务：兜底 MQ 消息丢失与库存漂移。
- * 订单表是唯一账本，库存是派生值。每轮按 ①关单 → ②补单 → ③库存重算 执行，
- * 账本修复（①②）必须先于库存重算（③）。只处理结束后 7 天内的券：窗口外不再兜底，
+ * 订单表是唯一账本，库存是派生值。每轮按 ①补单 → ②库存重算 执行，
+ * 账本修复（①）必须先于库存重算（②）。只处理结束后 7 天内的券：窗口外不再兜底，
  * 活动 key 出窗后续期 14d 后自然过期，历史 key 总量有界。
+ *
+ * <p>运维撤回（删订单行）只在活动结束后开放：活动期间 seckill:order 集合里还有该用户，
+ * ②补单会把删掉的行再补回来，DELETE 自愈不了；活动结束后 DELETE 由本轮 ② 统一收敛。
  */
 @Slf4j
 @Component
@@ -49,8 +52,6 @@ public class SeckillReconcileTask {
     @Resource
     private UidGenerator uidGenerator;
 
-    /** 超时关单阈值：与延迟消息档位一致（15 分钟） */
-    private static final int ORDER_TIMEOUT_MINUTES = 15;
     /** 秒杀结束多久后允许补单/重算（等消费重试链排空，重试 cadence 最长约 6 分钟） */
     private static final int RECONCILE_AFTER_END_MINUTES = 2;
     /** 对账窗口（天）：无下界会每轮全量扫历史券，成本随历史无限增长 */
@@ -62,8 +63,6 @@ public class SeckillReconcileTask {
     private static final long KEY_TTL_AFTER_END_SECONDS = 14 * 86400L;
     /** 对账分布式锁租期（秒）：小于调度间隔 60s，实例宕机后锁快速自动释放 */
     private static final long RECONCILE_LOCK_LEASE_SECONDS = 50;
-    /** 关单扫描批大小：只查 id + LIMIT 分批，防 broker 丢光关单消息的极端场景下全量拉取 OOM */
-    private static final int CLOSE_SCAN_BATCH_SIZE = 1000;
 
     /**
      * 每分钟执行。多实例用分布式锁保证单实例执行；任务幂等，超租期的并发无副作用。
@@ -84,14 +83,16 @@ public class SeckillReconcileTask {
             return;
         }
         try {
-            runStep("关单", this::closeTimeoutOrders);
             Boolean supplemented = runStep("补单", this::supplementMissingOrders);
             if (Boolean.TRUE.equals(supplemented)) {
                 // 补单是异步消息，本轮重算会读到「补的单还没落库」的账本，把库存算大；
                 // 跳过一轮等账本稳定，晚算没有代价，算错才有
                 log.warn("对账：本轮发生补单，跳过库存重算，下轮再算");
             } else {
-                runStep("库存重算", this::reconcileFinishedStocks);
+                runStep("库存重算", () -> {
+                    reconcileFinishedStocks();
+                    return true;
+                });
             }
         } finally {
             if (lock.isHeldByCurrentThread()) {
@@ -101,49 +102,12 @@ public class SeckillReconcileTask {
     }
 
     /** 执行单个对账步骤并独立捕获异常，失败返回 null 由调用方降级 */
-    private void runStep(String name, Runnable step) {
-        try {
-            step.run();
-        } catch (Exception e) {
-            log.error("对账步骤异常: " + name, e);
-        }
-    }
-
     private <T> T runStep(String name, Supplier<T> step) {
         try {
             return step.get();
         } catch (Exception e) {
             log.error("对账步骤异常: " + name, e);
             return null;
-        }
-    }
-
-    /**
-     * ① 关单兜底：按 createTime 扫描超时未支付订单，直接关单（不依赖 MQ）。
-     * 覆盖关单延迟消息的一切丢失场景（发送失败、broker 丢失、消费失败进 DLQ），
-     * 延迟与延迟消息同分布（15~16 分钟），cancelTimeoutOrder 幂等，二者并发安全。
-     *
-     * <p>分批拉取：broker 丢光关单消息的极端场景下未支付单可达海量（如百万库存售罄），
-     * 一次 .list() 全量拉实体必然 OOM。每批 CAS 关单后行自动离开谓词（status 变 4），
-     * 无需偏移量，同谓词重查即自然收敛。
-     */
-    private void closeTimeoutOrders() {
-        int scanned = 0;
-        List<VoucherOrder> batch;
-        do {
-            batch = voucherOrderService.lambdaQuery()
-                    .select(VoucherOrder::getId)
-                    .eq(VoucherOrder::getStatus, RedisConstants.ORDER_STATUS_UNPAID)
-                    .lt(VoucherOrder::getCreateTime, LocalDateTime.now().minusMinutes(ORDER_TIMEOUT_MINUTES))
-                    .last("LIMIT " + CLOSE_SCAN_BATCH_SIZE)
-                    .list();
-            for (VoucherOrder order : batch) {
-                voucherOrderService.cancelTimeoutOrder(order.getId());
-            }
-            scanned += batch.size();
-        } while (batch.size() == CLOSE_SCAN_BATCH_SIZE);
-        if (scanned > 0) {
-            log.warn("对账关单兜底：本轮处理 {} 笔超时未支付订单", scanned);
         }
     }
 
@@ -224,8 +188,13 @@ public class SeckillReconcileTask {
     }
 
     /**
-     * ③ 库存重算：expected = initial_stock − 有效订单数（1未支付/2已支付/3已核销），
-     * Redis 与 DB 统一改写。预期值只来自订单表，不存在修错方向，每轮收敛。
+     * ② 库存重算：expected = initial_stock − COUNT(*)，Redis 与 DB 统一改写。
+     * 预期值只来自订单表，不存在修错方向，每轮收敛。
+     *
+     * <p><b>COUNT(*) 不筛 used 不是省事，是语义要求</b>：initial_stock 是发放库存
+     * （能领多少张），不是使用库存。券被领走的那一刻就永久占掉一个名额，核销与否
+     * 不影响库存——used=0 与 used=1 在库存口径上完全等价。若将来有人把它「优化」成
+     * COUNT(WHERE used=0)，已核销的券会被剔出账本，凭空多放一批库存，直接超卖。
      */
     private void reconcileFinishedStocks() {
         LocalDateTime now = LocalDateTime.now();
@@ -240,35 +209,23 @@ public class SeckillReconcileTask {
                 // 只跳过重算不跳过续期：key 生命周期与账本无关，缺 initialStock 的券的 key 也要死亡
                 log.warn("对账跳过重算：voucherId={} 缺少 initialStock", voucherId);
             } else {
-                // 在途单守卫：活动刚结束时 15 分钟关单仍在发生，此时算出的 expected 下一轮就会被
-                // 关单改写——写下瞬态值再自打脸没有意义。等全部订单终态（无 status=1）后一次算准。
-                // 精确命中 idx_voucher_status 两列前缀，成本 O(在途单数)≈O(1)。
-                long pending = voucherOrderService.lambdaQuery()
+                long claimed = voucherOrderService.lambdaQuery()
                         .eq(VoucherOrder::getVoucherId, voucherId)
-                        .eq(VoucherOrder::getStatus, RedisConstants.ORDER_STATUS_UNPAID)
                         .count();
-                if (pending == 0) {
-                    long valid = voucherOrderService.lambdaQuery()
-                            .eq(VoucherOrder::getVoucherId, voucherId)
-                            .in(VoucherOrder::getStatus,
-                                    RedisConstants.ORDER_STATUS_UNPAID, RedisConstants.ORDER_STATUS_PAID,
-                                    RedisConstants.ORDER_STATUS_VERIFIED)
-                            .count();
-                    int expected = Math.max(0, initial - (int) valid);
+                int expected = Math.max(0, initial - (int) claimed);
 
-                    boolean dbOk = voucher.getStock() != null && voucher.getStock() == expected;
-                    String redisStock = stringRedisTemplate.opsForValue().get(SECKILL_STOCK_KEY + voucherId);
-                    boolean redisOk = String.valueOf(expected).equals(redisStock);
-                    if (!dbOk || !redisOk) {
-                        log.warn("对账库存重算：voucherId={}, db={}, redis={} → expected={}（初始={}, 有效订单={}）",
-                                voucherId, voucher.getStock(), redisStock, expected, initial, valid);
-                        stringRedisTemplate.opsForValue().set(
-                                SECKILL_STOCK_KEY + voucherId, String.valueOf(expected));
-                        seckillVoucherService.update(
-                                Wrappers.<SeckillVoucher>lambdaUpdate()
-                                        .set(SeckillVoucher::getStock, expected)
-                                        .eq(SeckillVoucher::getVoucherId, voucherId));
-                    }
+                boolean dbOk = voucher.getStock() != null && voucher.getStock() == expected;
+                String redisStock = stringRedisTemplate.opsForValue().get(SECKILL_STOCK_KEY + voucherId);
+                boolean redisOk = String.valueOf(expected).equals(redisStock);
+                if (!dbOk || !redisOk) {
+                    log.warn("对账库存重算：voucherId={}, db={}, redis={} → expected={}（初始={}, 已领取={}）",
+                            voucherId, voucher.getStock(), redisStock, expected, initial, claimed);
+                    stringRedisTemplate.opsForValue().set(
+                            SECKILL_STOCK_KEY + voucherId, String.valueOf(expected));
+                    seckillVoucherService.update(
+                            Wrappers.<SeckillVoucher>lambdaUpdate()
+                                    .set(SeckillVoucher::getStock, expected)
+                                    .eq(SeckillVoucher::getVoucherId, voucherId));
                 }
             }
 

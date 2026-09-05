@@ -31,11 +31,6 @@ public class RedisConstants {
      */
     public static final String SECKILL_CLAIM_KEY = "seckill:claim:";
     public static final long SECKILL_CLAIM_TTL_SECONDS = 1209600L;
-    /** 取消订单回补库存的幂等标记（按资源拆分）：Redis 侧，由回补 Lua 原子自管、永不删除 */
-    public static final String SECKILL_RESTORE_REDIS_KEY = "seckill:restore:redis:";
-    /** 取消订单回补库存的幂等标记（按资源拆分）：DB 侧，仅 DB 更新失败时删除重试 */
-    public static final String SECKILL_RESTORE_DB_KEY = "seckill:restore:db:";
-    public static final long SECKILL_RESTORE_TTL_SECONDS = 1209600L;
     /** RocketMQ 事务消息本地标记（与 Lua 扣库存同脚本写入，回查用） */
     public static final String SECKILL_TXN_KEY = "seckill:txn:";
     /** 事务标记 TTL（秒），需覆盖 Broker 回查窗口 */
@@ -57,11 +52,4 @@ public class RedisConstants {
     public static final String FEED_KEY = "feed:";
     public static final String SHOP_GEO_KEY = "shop:geo:";
     public static final String USER_SIGN_KEY = "sign:";
-
-    /** 订单状态：1未支付 2已支付 3已核销 4已取消 5退款中 6已退款。有效订单口径（对账库存重算、
-     *  一人一单差集）= 1/2/3：核销是支付后的履约态，同样占用库存；核销流程当前未实现，防御性对齐 */
-    public static final int ORDER_STATUS_UNPAID = 1;
-    public static final int ORDER_STATUS_PAID = 2;
-    public static final int ORDER_STATUS_VERIFIED = 3;
-    public static final int ORDER_STATUS_CANCELLED = 4;
 }

@@ -33,44 +33,30 @@ public class VoucherOrder implements Serializable {
     private Long id;
 
     /**
-     * 下单的用户id
+     * 领取的用户id
      */
     private Long userId;
 
     /**
-     * 购买的代金券id
+     * 领取的优惠券id
      */
     private Long voucherId;
 
     /**
-     * 支付方式 1：余额支付；2：支付宝；3：微信
+     * 是否已使用：0=已领取未使用；1=已使用（核销）。
+     * 领券落库不写这一列，靠 DB 默认 0；核销由商家端/线下 CAS 写入（本项目不提供核销接口）
      */
-    private Integer payType;
+    private Integer used;
 
     /**
-     * 订单状态，1：未支付；2：已支付；3：已核销；4：已取消；5：退款中；6：已退款
-     */
-    private Integer status;
-
-    /**
-     * 下单时间
+     * 领取时间
      */
     private LocalDateTime createTime;
 
     /**
-     * 支付时间
-     */
-    private LocalDateTime payTime;
-
-    /**
-     * 核销时间
+     * 核销时刻
      */
     private LocalDateTime useTime;
-
-    /**
-     * 退款时间
-     */
-    private LocalDateTime refundTime;
 
     /**
      * 更新时间

@@ -22,8 +22,7 @@ import java.nio.charset.StandardCharsets;
  * Broker 自动把消息转入 {@code %DLQ%order-consumer-group}。
  *
  * <p>死信 = 重试链路已放弃，消息不丢单但不保证及时处理——CREATE 死信等对账补单
- * （SeckillReconcileTask#supplementMissingOrders），TIMEOUT 死信等关单兜底
- * （closeTimeoutOrders）。这里只做监控告警打点 + 留痕日志，不尝试重新处理：
+ * （SeckillReconcileTask#supplementMissingOrders）。这里只做监控告警打点 + 留痕日志，不尝试重新处理：
  * 在死信消费者里重投等于把重试上限变成摆设，拖尾又回来了。
  *
  * <p>注意 topic 在首条死信产生时才由 Broker 创建，启动时订阅不存在的 topic 是正常的

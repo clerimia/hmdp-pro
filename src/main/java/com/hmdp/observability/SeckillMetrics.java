@@ -21,7 +21,6 @@ public class SeckillMetrics {
     public static final String SECKILL_LATENCY = "hmdp.seckill.latency";
     public static final String RATE_LIMIT_FALLBACK = "hmdp.ratelimit.fallback";
     public static final String ORDER_CONSUME = "hmdp.order.consume";
-    public static final String ORDER_TIMEOUT_SEND_ERROR = "hmdp.order.timeout_send_error";
     public static final String ORDER_DEAD_LETTER = "hmdp.order.dead_letter";
     public static final String DEGRADED = "hmdp.seckill.degraded";
 
@@ -59,14 +58,9 @@ public class SeckillMetrics {
         recorder.increment(RATE_LIMIT_FALLBACK, "strategy", strategy);
     }
 
-    /** MQ 消息消费结果，tag 取消息 Tag（CREATE / TIMEOUT） */
+    /** MQ 消息消费结果，tag 取消息 Tag（CREATE） */
     public void orderConsumed(String tag, boolean success) {
         recorder.increment(ORDER_CONSUME, "tag", tag, "result", success ? "ok" : "error");
-    }
-
-    /** 超时关单延迟消息发送失败（已记入 Redis 重试集合，由对账任务重发） */
-    public void orderTimeoutSendError() {
-        recorder.increment(ORDER_TIMEOUT_SEND_ERROR);
     }
 
     /** 订单消息超过重试上限落入死信 topic：重试链路已放弃，等待对账/人工介入 */

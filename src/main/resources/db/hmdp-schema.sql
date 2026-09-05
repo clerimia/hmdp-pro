@@ -132,32 +132,34 @@ CREATE TABLE `tb_seckill_voucher`  (
 
 -- ----------------------------
 -- 8. 优惠券订单表（主键由百度 UidGenerator 生成，非自增）
+--    业务语义是「用户-优惠券关联表」：一行 = 一次领取。「创建一行 = 已领取」，
+--    是否已使用用布尔列 used 表达；核销由商家端/线下动作写入（本项目不提供核销接口）。
 -- ----------------------------
 DROP TABLE IF EXISTS `tb_voucher_order`;
 CREATE TABLE `tb_voucher_order`  (
   `id` bigint(20) NOT NULL COMMENT '主键',
-  `user_id` bigint(20) UNSIGNED NOT NULL COMMENT '下单的用户id',
-  `voucher_id` bigint(20) UNSIGNED NOT NULL COMMENT '购买的代金券id',
-  `pay_type` tinyint(1) UNSIGNED NOT NULL DEFAULT 1 COMMENT '支付方式 1：余额支付；2：支付宝；3：微信',
-  `status` tinyint(1) UNSIGNED NOT NULL DEFAULT 1 COMMENT '订单状态，1：未支付；2：已支付；3：已核销；4：已取消；5：退款中；6：已退款',
-  `create_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '下单时间',
-  `pay_time` timestamp NULL DEFAULT NULL COMMENT '支付时间',
-  `use_time` timestamp NULL DEFAULT NULL COMMENT '核销时间',
-  `refund_time` timestamp NULL DEFAULT NULL COMMENT '退款时间',
+  `user_id` bigint(20) UNSIGNED NOT NULL COMMENT '领取的用户id',
+  `voucher_id` bigint(20) UNSIGNED NOT NULL COMMENT '领取的优惠券id',
+  `used` tinyint(1) UNSIGNED NOT NULL DEFAULT 0 COMMENT '是否已使用：0=已领取未使用；1=已使用（核销）。领券落库不写这一列，靠 DB 默认 0',
+  `create_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '领取时间',
+  `use_time` timestamp NULL DEFAULT NULL COMMENT '核销时刻',
   `update_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
   PRIMARY KEY (`id`) USING BTREE,
   UNIQUE INDEX `uk_user_voucher`(`user_id`, `voucher_id`) USING BTREE,
   -- 对账任务专用索引。原本只有 uk_user_voucher(user_id, voucher_id)，它按最左前缀
   -- 只能服务 user_id 开头的查询，对账按 voucher_id 维度查时全部退化为全表/全索引扫描。
-  -- 订单表是持续增长的账本，对账每 60s 跑一轮，缺索引意味着每分钟 3 次全表扫描。
-  -- 20 万行实测：三条查询扫描行数 199515 → 1~4。
-  --   idx_voucher_status：②补单（WHERE voucher_id=?）与③库存重算（WHERE voucher_id=? AND status IN (1,2)）
-  --                       共用——后者用到完整两列，前者只用前缀 voucher_id。
-  --   idx_status_create_time：①关单兜底扫描（WHERE status=1 AND create_time<?）。
-  --                           status 在前是因为它是等值条件，create_time 是范围条件，
-  --                           范围列之后的索引列用不上，等值列必须放前面。
-  INDEX `idx_voucher_status`(`voucher_id`, `status`) USING BTREE,
-  INDEX `idx_status_create_time`(`status`, `create_time`) USING BTREE
+  -- 订单表是持续增长的账本，对账每 60s 跑一轮，缺索引意味着每分钟 2 次全表扫描。
+  -- 20 万行实测（改造前基线，旧索引 idx_voucher_status(voucher_id, status)）：199515 → 1~4；
+  -- 索引已随 status 列删除降为单列 idx_voucher，重算不再筛状态，行数需在新索引上重测。
+  INDEX `idx_voucher`(`voucher_id`) USING BTREE,
+  -- used 与 use_time 的合法组合由 DB 层锁死：「用了没时间」「没用却填了时间」根本存不进去。
+  -- 核销唯一写入路径是商家端 CAS：
+  --   UPDATE tb_voucher_order SET used=1, use_time=NOW() WHERE id=? AND used=0
+  -- 影响行数 1 = 首次核销，0 = 已核销过（跳过，不覆盖 use_time），天然满足本约束。
+  CONSTRAINT `chk_used_consistency` CHECK (
+      (`used` = 0 AND `use_time` IS NULL)
+   OR (`used` = 1 AND `use_time` IS NOT NULL)
+  )
 ) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_general_ci ROW_FORMAT = Compact;
 
 -- ----------------------------
