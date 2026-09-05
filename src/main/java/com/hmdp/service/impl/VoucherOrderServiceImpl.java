@@ -38,6 +38,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import javax.annotation.Resource;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.Collections;
 import java.util.HashMap;
@@ -93,6 +94,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
     /** 对比测试：只扣库存、不做 Lua 一人一单（EARLY 档位） */
     private static final DefaultRedisScript<Long> SECKILL_STOCK_ONLY_SCRIPT;
+    /** 取消订单回补 Redis 库存（SETNX 幂等标记 + 条件 incr，同脚本原子） */
+    private static final DefaultRedisScript<Long> RESTORE_STOCK_SCRIPT;
 
     /**
      * Redis 开关：seckill:test:protection = FULL|LEGACY|EARLY（默认 FULL）
@@ -102,6 +105,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      *   <li>{@code EARLY}：入口换用只扣库存的 Lua，不做一人一单，制造并发窗口验证
      *       DB 唯一索引的兜底能力（该档位不写 seckill:order 集合，对账补单覆盖不到它）</li>
      * </ul>
+     * 档位由 {@link #oneOrderProtection()} 读取，带 3s 本地快照缓存（测试开关容忍 3s 滞后，
+     * 换来消费端每条消息省一次 Redis GET）；Redis 读失败沿用上一快照，不阻断主流程。
      */
     public static final String ONE_ORDER_PROTECTION_KEY = "seckill:test:protection";
 
@@ -116,41 +121,130 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         SECKILL_STOCK_ONLY_SCRIPT = new DefaultRedisScript<>();
         SECKILL_STOCK_ONLY_SCRIPT.setLocation(new ClassPathResource("seckill-stock-only.lua"));
         SECKILL_STOCK_ONLY_SCRIPT.setResultType(Long.class);
-    }
 
-    private String oneOrderProtection() {
-        String mode = stringRedisTemplate.opsForValue().get(ONE_ORDER_PROTECTION_KEY);
-        return mode == null || mode.isEmpty() ? "FULL" : mode.trim().toUpperCase();
+        RESTORE_STOCK_SCRIPT = new DefaultRedisScript<>();
+        RESTORE_STOCK_SCRIPT.setLocation(new ClassPathResource("seckill-restore-stock.lua"));
+        RESTORE_STOCK_SCRIPT.setResultType(Long.class);
     }
 
     /**
-     * 取消超时订单：仅当订单仍处于未支付状态时回补库存
-     * 由 RocketMQ 延迟消息触发；通过状态乐观更新保证幂等
+     * 档位开关快照：值与过期时间绑在同一不可变对象里（两个独立 volatile 会有撕裂读——
+     * 新过期时间配旧值）。读失败沿用上一快照，退避压到 1s，故障期不让每条消费消息
+     * 都吃一次 Redis 命令超时（800ms）。
+     */
+    private static final class ModeSnapshot {
+        final String mode;
+        final long expiresAt;
+
+        ModeSnapshot(String mode, long expiresAt) {
+            this.mode = mode;
+            this.expiresAt = expiresAt;
+        }
+    }
+
+    private volatile ModeSnapshot protectionSnapshot = new ModeSnapshot("FULL", 0L);
+
+    /** 档位快照有效期：测试开关容忍 3s 滞后，换来消费端每条消息省一次 Redis GET */
+    private static final long PROTECTION_CACHE_MILLIS = 3_000L;
+    /** 档位读失败后的短退避：避免 Redis 故障期高频重读 */
+    private static final long PROTECTION_RETRY_BACKOFF_MILLIS = 1_000L;
+
+    private String oneOrderProtection() {
+        ModeSnapshot snapshot = protectionSnapshot;
+        long now = System.currentTimeMillis();
+        if (now < snapshot.expiresAt) {
+            return snapshot.mode;
+        }
+        try {
+            String mode = stringRedisTemplate.opsForValue().get(ONE_ORDER_PROTECTION_KEY);
+            String normalized = mode == null || mode.isEmpty() ? "FULL" : mode.trim().toUpperCase();
+            protectionSnapshot = new ModeSnapshot(normalized, now + PROTECTION_CACHE_MILLIS);
+            return normalized;
+        } catch (Exception e) {
+            // 读失败沿用上一快照继续用（默认 FULL，行为最保守），1s 内不再重读。
+            // 测试开关读失败不应阻断下单/落库主流程。
+            protectionSnapshot = new ModeSnapshot(snapshot.mode, now + PROTECTION_RETRY_BACKOFF_MILLIS);
+            log.warn("档位开关读取失败，沿用上一快照 {}（3s 缓存语义）", snapshot.mode, e);
+            return snapshot.mode;
+        }
+    }
+
+    /**
+     * 取消超时订单并回补库存：由 RocketMQ 延迟消息触发，对账兜底扫描也会调用。
+     *
+     * <p><b>幂等设计（按资源拆分标记，而非单一状态 CAS）</b>：状态 CAS（1→4）只保证
+     * 「不重复关单」，不保证「不重复回补」——原实现 CAS 后 incr/DB +1 抛异常，消息重投时
+     * status 已是 4 被短路 return，这份库存就永久丢了（活动期间少卖）。
+     *
+     * <p>回补分两个半边、各自幂等：
+     * <ul>
+     *   <li><b>Redis 半边</b>：seckill-restore-stock.lua——SETNX 标记与条件 incr 同脚本
+     *   原子执行，天然 exactly-once（客户端超时不知脚本是否执行过也没关系，重试 SETNX
+     *   失败即跳过）。脚本异常直接上抛重投，不删标记。</li>
+     *   <li><b>DB 半边</b>：独立标记 seckill:restore:db:{orderId}，SETNX 成功者执行
+     *   stock+1；仅 DB 更新异常时 DELETE 标记再上抛，重投只重做 DB 半边。</li>
+     * </ul>
+     *
+     * <p><b>为何不用单标记 + 异常时删除重做</b>：若 Redis incr 成功后 DB 抛异常，删标记
+     * 重投会把 Redis 半边也重做 → Redis 库存 +2 → 额外用户过闸 → <b>超卖</b>。本项目第一
+     * 不变量是「永不过补优先于尽量不丢补」：丢补是少卖（方向安全，由活动结束对账收敛），
+     * 过补直接击穿入口闸门。拆分后任何路径都不会重做已成功的半边。
+     *
+     * <p>已知接受的边界（均为窄崩溃窗口，方向安全）：DB 标记 SETNX 后、UPDATE 前进程死亡
+     * → 少补 1，活动结束对账收敛；UPDATE 已提交但客户端视为异常 → 重投 DB 再 +1，仅 DB
+     * 显示漂移（入口闸门是 Redis，不会超卖），出窗对账修正。
+     *
+     * <p>注意：本方法不做 seckill:order 集合的 srem——「一人一次机会」是有意设计
+     * （防占位/防黄牛），取消只回补库存给别人买，本人不能再抢。
      */
     public void cancelTimeoutOrder(Long orderId) {
         VoucherOrder order = getById(orderId);
-        if (order == null || order.getStatus() == null || order.getStatus() != ORDER_STATUS_UNPAID) {
+        if (order == null || order.getStatus() == null) {
             return;
         }
-
-        // 状态置为已取消
-        boolean updated = update()
-                .set("status", ORDER_STATUS_CANCELLED)
-                .eq("id", orderId)
-                .eq("status", ORDER_STATUS_UNPAID)
-                .update();
-        if (!updated) {
-            // 并发下已支付，无需处理
+        if (order.getStatus() == ORDER_STATUS_UNPAID) {
+            // 首次关单：CAS 1→4。失败 = 并发支付或并发关单者已处理，交由对方完成回补
+            boolean updated = update()
+                    .set("status", ORDER_STATUS_CANCELLED)
+                    .eq("id", orderId)
+                    .eq("status", ORDER_STATUS_UNPAID)
+                    .update();
+            if (!updated) {
+                return;
+            }
+        } else if (order.getStatus() != ORDER_STATUS_CANCELLED) {
+            // 已支付/核销/退款链路，不关不补
             return;
         }
+        // 走到这里 status 必为 CANCELLED：要么是刚 CAS 成功的首关线程，
+        // 要么是回补中途失败后的重投线程——两个半边各自 SETNX 串行，谁拿到谁干活。
 
-        // 回补 Redis 库存
-        stringRedisTemplate.opsForValue().increment(SECKILL_STOCK_KEY + order.getVoucherId());
-        // 回补 DB 库存
-        seckillVoucherService.update()
-                .setSql("stock = stock + 1")
-                .eq("voucher_id", order.getVoucherId())
-                .update();
+        // ① Redis 回补：Lua 原子（SETNX 标记 + 条件 incr）。异常直接上抛重投，
+        //    不删任何标记（脚本原子性自管，重投 SETNX 失败即跳过）
+        Long restored = stringRedisTemplate.execute(
+                RESTORE_STOCK_SCRIPT,
+                Collections.emptyList(),
+                orderId.toString(),
+                order.getVoucherId().toString(),
+                String.valueOf(SECKILL_RESTORE_TTL_SECONDS));
+        log.info("订单 {} 取消回补 Redis 库存：{}", orderId,
+                restored != null && restored == 1L ? "本次执行" : "已执行过（幂等跳过）");
+
+        // ② DB 回补：独立标记。仅 DB 更新异常时删除标记再上抛，重投只重做这一半边
+        Boolean dbMarked = stringRedisTemplate.opsForValue().setIfAbsent(
+                SECKILL_RESTORE_DB_KEY + orderId, "1", Duration.ofSeconds(SECKILL_RESTORE_TTL_SECONDS));
+        if (Boolean.TRUE.equals(dbMarked)) {
+            try {
+                seckillVoucherService.update()
+                        .setSql("stock = stock + 1")
+                        .eq("voucher_id", order.getVoucherId())
+                        .update();
+            } catch (Exception e) {
+                // 回滚幂等闸门让重投重做 DB 半边；Redis 半边已原子完成，不会被重做
+                stringRedisTemplate.delete(SECKILL_RESTORE_DB_KEY + orderId);
+                throw e;
+            }
+        }
         log.info("订单 {} 超时未支付，已取消并回补库存，券 {}", orderId, order.getVoucherId());
     }
 
@@ -286,15 +380,11 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             try {
                 rocketMQProducer.sendOrderTimeout(orderId);
             } catch (Exception e) {
-                // 关单延迟消息发送失败：只记日志的话订单会永远停在「未支付」（无自动关单保障）。
-                // 升级为：记入 Redis 重试集合 → 对账任务每轮重发（SeckillReconcileTask#retryTimeoutMessages）
-                // → 重发后仍到不了点还有 closeTimeoutOrders 按 createTime 扫描关单兜底。
-                // cancelTimeoutOrder 是 CAS 幂等（仅未支付才关），重复触发无副作用。
+                // 发送失败无需额外补偿：对账任务按 createTime 扫描超时未支付订单直接关单，
+                // 不依赖这条消息到达（延迟同分布 15~16 分钟）。指标保留——发送失败
+                // 是 MQ 健康的观测信号。
                 seckillMetrics.orderTimeoutSendError();
-                stringRedisTemplate.opsForSet().add(
-                        SECKILL_TIMEOUT_RETRY_KEY, orderId.toString());
-                log.error("超时关单延迟消息发送失败，已记入重试集合等待对账重发, orderId={}",
-                        orderId, e);
+                log.error("超时关单延迟消息发送失败（由对账关单兜底）, orderId={}", orderId, e);
             }
             writeQueueStatusSafe(orderId, SeckillMode.QUEUE_SUCCESS);
         } catch (RuntimeException e) {
@@ -437,27 +527,70 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
     }
 
+    /**
+     * 秒杀落库结果查询（降级轮询用）。
+     *
+     * <p><b>三级短路，越靠前越便宜：</b>
+     * <ol>
+     *   <li>Redis 排队状态命中 → 直接返回，不碰 DB；</li>
+     *   <li>未命中 → 查订单表（归属校验下压成 SQL 条件）；</li>
+     *   <li>查无此单 → 回写短 TTL 空值标记，让同一个不存在的 orderId 在 TTL 内不再穿透。</li>
+     * </ol>
+     *
+     * <p><b>为什么第 ① 步不校验归属：</b>排队状态的 value 只有 WAITING/SUCCESS/FAIL_* 这几个
+     * 状态字，没有任何敏感信息；而一旦校验归属就得先查 DB，这一步「不打 DB」的意义就没了。
+     * 真正让 orderId 不可枚举的是它本身——UidGenerator 出来的 63 位雪花 ID 带时间戳
+     * （28 bit）+ workerId（22 bit）+ 序列号（13 bit），攻击者猜不出一段有效区间。
+     * 这是个明确的取舍：用「不可枚举」换「不查 DB」，收益是降级窗口里 DB 不被轮询压垮。
+     *
+     * <p><b>为什么第 ② 步必须校验归属：</b>订单表里有 userId、createTime 等敏感字段，
+     * 且撞库成功的收益（拿到他人订单详情）远大于成本。归属判断下压进 SQL 的 WHERE，
+     * 让「查不到」与「不是你的」返回完全相同的 NOT_FOUND——不给订单号枚举探测任何信号。
+     */
     @Override
     public Result getSeckillResult(Long orderId) {
+        UserDTO user = UserHolder.getUser();
+        if (user == null) {
+            return Result.fail(ErrorCode.LOGIN_REQUIRED);
+        }
         if (orderId == null) {
-            return Result.fail("订单号不能为空");
+            return Result.fail(ErrorCode.PARAM_INVALID);
         }
         Map<String, Object> data = new HashMap<>(4);
         data.put("orderId", orderId);
 
+        // ① 排队状态命中：直接返回，不打 DB
         String status = stringRedisTemplate.opsForValue().get(SECKILL_QUEUE_KEY + orderId);
         if (status != null) {
             data.put("status", status);
             return Result.ok(data);
         }
-        // 无排队状态：状态 TTL 过期、或入口写入失败 → 查订单表兜底
-        VoucherOrder order = getById(orderId);
+
+        // ② 未命中：状态 TTL 过期、或入口/消费者写入失败 → 查订单表兜底。
+        //    归属校验下压成 SQL 条件，查不到与不是你的统一走 NOT_FOUND
+        VoucherOrder order;
+        try {
+            order = query().eq("id", orderId).eq("user_id", user.getId()).one();
+        } catch (Exception e) {
+            // 排队状态缺失 + 订单表查不动 = 结果未知，不是失败。
+            // 这里是降级窗口里最容易被打到的分支：DB 故障时入口会返回 ORDER_PROCESSING
+            // 并把用户引到轮询上，而轮询的兜底恰好就是查这张表。
+            // 抛 500 会让前端把「正在落库」误判成「彻底失败」并停止轮询，
+            // 而实测 DB 恢复后约 90 秒内订单会全部自动追平——所以这里必须返回 UNKNOWN
+            // 让前端继续等，而不是把可恢复的等待判成终态。
+            log.warn("排队状态缺失且订单表查询失败，返回 UNKNOWN 让前端继续轮询, orderId={}", orderId, e);
+            data.put("status", SeckillMode.QUEUE_UNKNOWN);
+            return Result.ok(data);
+        }
         if (order != null) {
             data.put("status", SeckillMode.QUEUE_SUCCESS);
             data.put("orderStatus", order.getStatus());
             return Result.ok(data);
         }
-        data.put("status", "NOT_FOUND");
+
+        // ③ 查无此单：写空值标记，防同一个伪造 orderId 反复穿透
+        writeNullStatusSafe(orderId);
+        data.put("status", SeckillMode.QUEUE_NOT_FOUND);
         return Result.ok(data);
     }
 
@@ -468,6 +601,23 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 SECKILL_QUEUE_TTL_MINUTES,
                 TimeUnit.MINUTES
         );
+    }
+
+    /**
+     * 写「查无此单」空值标记。与 {@link #writeQueueStatusSafe} 同理——这只是旁路优化，
+     * 写失败最多让防穿透失效（还有限流兜底），绝不能因此让查询接口报错。
+     */
+    private void writeNullStatusSafe(Long orderId) {
+        try {
+            stringRedisTemplate.opsForValue().set(
+                    SECKILL_QUEUE_KEY + orderId,
+                    SeckillMode.QUEUE_NOT_FOUND,
+                    SECKILL_QUEUE_NULL_TTL_SECONDS,
+                    TimeUnit.SECONDS
+            );
+        } catch (Exception e) {
+            log.warn("空值标记写入失败，本次查询未做防穿透, orderId={}", orderId, e);
+        }
     }
 
     /**

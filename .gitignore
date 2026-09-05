@@ -40,3 +40,21 @@ tech/
 
 ### 本地开发覆盖配置（含本机地址/账号，不进仓库）###
 src/main/resources/application-local*.yaml
+
+### Trae IDE 私有产物（与 .idea/.vscode 同类）###
+.trae/
+
+### 本地 docker-compose 覆盖配置（SMTP 授权码等，不进仓库）###
+docker-compose.override.yml
+.env
+
+### hm-dianping-frontend：nginx 部署目录，只保留 H5 被测页面 ###
+hm-dianping-frontend/logs/
+hm-dianping-frontend/temp/
+hm-dianping-frontend/conf/
+hm-dianping-frontend/contrib/
+hm-dianping-frontend/docs/
+hm-dianping-frontend/nginx.exe
+hm-dianping-frontend/html/index.html
+hm-dianping-frontend/html/50x.html
+hm-dianping-frontend/html/hmdp/imgs/

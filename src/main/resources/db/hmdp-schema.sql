@@ -124,7 +124,10 @@ CREATE TABLE `tb_seckill_voucher`  (
   `begin_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '生效时间',
   `end_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '失效时间',
   `update_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
-  PRIMARY KEY (`voucher_id`) USING BTREE
+  PRIMARY KEY (`voucher_id`) USING BTREE,
+  -- 对账每轮都要筛「已结束的券」（②补单 与 ③库存重算 各一次），券表虽小但会随运营增长，
+  -- 且这是每 60s 执行一次的定时任务，全表扫描没有理由保留。
+  INDEX `idx_end_time`(`end_time`) USING BTREE
 ) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '秒杀优惠券表，与优惠券是一对一关系' ROW_FORMAT = Compact;
 
 -- ----------------------------
@@ -143,7 +146,18 @@ CREATE TABLE `tb_voucher_order`  (
   `refund_time` timestamp NULL DEFAULT NULL COMMENT '退款时间',
   `update_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
   PRIMARY KEY (`id`) USING BTREE,
-  UNIQUE INDEX `uk_user_voucher`(`user_id`, `voucher_id`) USING BTREE
+  UNIQUE INDEX `uk_user_voucher`(`user_id`, `voucher_id`) USING BTREE,
+  -- 对账任务专用索引。原本只有 uk_user_voucher(user_id, voucher_id)，它按最左前缀
+  -- 只能服务 user_id 开头的查询，对账按 voucher_id 维度查时全部退化为全表/全索引扫描。
+  -- 订单表是持续增长的账本，对账每 60s 跑一轮，缺索引意味着每分钟 3 次全表扫描。
+  -- 20 万行实测：三条查询扫描行数 199515 → 1~4。
+  --   idx_voucher_status：②补单（WHERE voucher_id=?）与③库存重算（WHERE voucher_id=? AND status IN (1,2)）
+  --                       共用——后者用到完整两列，前者只用前缀 voucher_id。
+  --   idx_status_create_time：①关单兜底扫描（WHERE status=1 AND create_time<?）。
+  --                           status 在前是因为它是等值条件，create_time 是范围条件，
+  --                           范围列之后的索引列用不上，等值列必须放前面。
+  INDEX `idx_voucher_status`(`voucher_id`, `status`) USING BTREE,
+  INDEX `idx_status_create_time`(`status`, `create_time`) USING BTREE
 ) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_general_ci ROW_FORMAT = Compact;
 
 -- ----------------------------

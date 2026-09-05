@@ -31,11 +31,16 @@ public class MvcConfig implements WebMvcConfigurer {
                         "/user/code",
                         "/user/login"
                 ).order(1);
-        // 精确到「下单」这一个动作，不用 /voucher-order/seckill/** ——
-        // 后者会连 GET /seckill/result/{orderId}（结果轮询）一起限流：
-        // 用户轮询几次就烧光自己的下单配额，且指标基数被轮询抬高。
+        // 逐个 path 精确挂载，不用 /voucher-order/seckill/** —— 后者会把结果查询、
+        // 支付查询全部塞进同一个限流桶，用户轮询几次就烧光自己的下单配额。
+        // 落地这一步很关键：拦截器内部已经按 URI 分好了三个桶，但只注册下单 path 的话，
+        // result 分支永远不会被执行，那道「查落库 10 次/秒」的限流就是空话。
+        // 具体分桶规则与配额见 SlidingWindowInterceptor 类注释。
+        // 注：pay 分支（GET /voucher-order/pay/result/{orderId}）暂未挂载——支付链路本轮不做，
+        // 待该接口实现后在此补上 path 即可，拦截器与 yaml 配额都已就位。
         registry.addInterceptor(slidingWindowInterceptor)
-                .addPathPatterns("/voucher-order/seckill/{id}")
+                .addPathPatterns("/voucher-order/seckill/{id}",
+                        "/voucher-order/seckill/result/{orderId}")
                 .order(2);
     }
 }

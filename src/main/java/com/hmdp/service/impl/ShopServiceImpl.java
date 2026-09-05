@@ -151,8 +151,12 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         if (id == null) {
             return Result.fail("店铺id不能为空");
         }
-        // 1.更新数据库
-        updateById(shop);
+        // 1.更新数据库。校验影响行数：id 不存在时 updateById 影响 0 行返回 false，
+        //   原实现忽略返回值——对不存在的店铺伪报成功，还触发一次无意义的缓存删除
+        boolean updated = updateById(shop);
+        if (!updated) {
+            return Result.fail("店铺不存在！");
+        }
         // 2.事务提交后再失效多级缓存（Caffeine + Redis）：
         //   - 缓存组件故障不应阻断业务主流程（此前写在事务内，Redis 故障会连带业务回滚）；
         //   - 事务回滚时也不会留下「缓存已删 + 库里还是旧值」的错位。

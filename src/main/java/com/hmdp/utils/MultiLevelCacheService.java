@@ -31,6 +31,11 @@ import static com.hmdp.utils.RedisConstants.*;
  *   → Redis 毫秒级（网络 IO）
  *   → MySQL 毫秒~秒级（磁盘 IO）
  * </pre>
+ *
+ * <p><b>缓存值不可变约定</b>：L1/L2 存的是反序列化后的共享对象引用（同 key 的所有
+ * 请求拿到同一实例），调用方<b>不得修改</b>返回值或缓存对象——任何 in-place 修改
+ * 会直接污染两级缓存。不做防御性拷贝是性能取舍（每次 put/get 走序列化会吃掉
+ * 本地缓存的纳秒级优势）。
  */
 @Slf4j
 @Component
@@ -156,8 +161,10 @@ public class MultiLevelCacheService {
             return data;
         }
 
-        // 空值防穿透
+        // 空值防穿透：空串标记也是从 Redis 取得的有效响应，同样计入 L2 命中
+        // （口径：所有「从 Redis 取得响应且未落 DB」的读均计 L2，否则看板会低估 L2 命中率）
         if (json != null) {
+            cacheMetrics.hit(CacheMetrics.LEVEL_L2);
             return null;
         }
 
@@ -209,9 +216,11 @@ public class MultiLevelCacheService {
 
         if (locked) {
             try {
-                // 双重检查：拿到锁后再查一次缓存，防止锁等待期间对方已完成重建
+                // 双重检查：拿到锁后再查一次缓存，防止锁等待期间对方已完成重建。
+                // 命中同样计 L2——它是真实的 Redis 读响应，漏计会低估命中率
                 String json = stringRedisTemplate.opsForValue().get(key);
                 if (StrUtil.isNotBlank(json)) {
+                    cacheMetrics.hit(CacheMetrics.LEVEL_L2);
                     return fromLogicalExpireJson(json, type);
                 }
                 return loadAndCache(key, id, dbFallback, ttl, unit,
@@ -230,9 +239,11 @@ public class MultiLevelCacheService {
             try {
                 String json = stringRedisTemplate.opsForValue().get(key);
                 if (StrUtil.isNotBlank(json)) {
+                    cacheMetrics.hit(CacheMetrics.LEVEL_L2);
                     return fromLogicalExpireJson(json, type);
                 }
                 if (json != null) {
+                    cacheMetrics.hit(CacheMetrics.LEVEL_L2); // 空值标记同样是 L2 响应
                     return null; // 空值防穿透标记：数据真不存在，不必再等
                 }
             } catch (Exception e) {
@@ -307,8 +318,15 @@ public class MultiLevelCacheService {
             }
             try {
                 R data = dbFallback.apply(id);
-                if (data != null && !isStaleSnapshot(id, data,
-                        snapshotVersionOf, currentVersionLoader)) {
+                if (data == null) {
+                    // DB 已无此行（物理删除）：主动删掉旧缓存，让后续请求走 miss → 互斥锁 → 空值标记。
+                    // 旧实现只跳过写回不删 key——被删商铺的旧值会一直循环触发重建（查到 null → 不动），
+                    // 驻留到物理 TTL 保险丝（3 倍逻辑 TTL）耗尽才消失。
+                    // 顺序：先删长命的 L2 再清 L1——中途崩溃时 L1 幽灵最多活 30s（自身 TTL 自愈），方向安全。
+                    // delete 与并发 evict 是幂等交叠（删一个已被 evict 删掉的 key 是 no-op），无新竞态
+                    stringRedisTemplate.delete(keyPrefix + id);
+                    shopLocalCache.invalidate(keyPrefix + id);
+                } else if (!isStaleSnapshot(id, data, snapshotVersionOf, currentVersionLoader)) {
                     writeWithLogicalExpire(keyPrefix + id, data, ttl, unit);
                 }
                 cacheMetrics.rebuilt(true);
