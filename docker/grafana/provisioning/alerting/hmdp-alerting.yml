@@ -1,0 +1,108 @@
+# Grafana 统一告警（Unified Alerting）provisioning
+#
+# 设计立场（与 OrderDeadLetterConsumer 的注释呼应）：
+#   死信量健康状态恒为 0，任何 >0 都是异常信号（P2 级）；
+#   业务侧对账任务分钟级自动兜底，告警只负责「让放弃被看见」，不参与业务恢复。
+#
+# 触发链路：Micrometer Counter hmdp_order_dead_letter_total（业务代码只打点）
+#           → Prometheus 抓取存储 → Grafana 规则评估（本文件）→ SMTP 邮件通知。
+#
+# !!! 部署前必改（三处）!!!
+#   1. docker-compose.yml 里 grafana 服务的 GF_SMTP_USER / GF_SMTP_PASSWORD
+#      （QQ 邮箱：设置 → 账号 → 开启 IMAP/SMTP 服务 → 生成授权码，填授权码不是登录密码）
+#   2. 本文件下方 contactPoints 的 addresses（收件邮箱）
+#   未替换时：告警规则照常评估、Grafana UI（Alerting → Alert rules）照常显示
+#   Firing/Normal 状态，仅「发信」失败（Grafana 日志可见投递错误）。
+apiVersion: 1
+
+# ── 联系点：死信告警的邮件出口 ──────────────────────────────────────
+# 发件服务器由 Grafana 的 SMTP 配置决定（docker-compose.yml 的 GF_SMTP_* 环境变量），
+# 这里只指定收件人。要同时发多人：addresses 用逗号分隔。
+contactPoints:
+  - orgId: 1
+    name: email-receiver
+    receivers:
+      - uid: hmdp-email-receiver
+        type: email
+        settings:
+          addresses: REPLACE_ME@example.com
+        # 如需改回 webhook（钉钉/企微需自建转发端）：
+        # - uid: hmdp-dingtalk-webhook
+        #   type: webhook
+        #   settings:
+        #     httpMethod: POST
+        #     url: https://oapi.dingtalk.com/robot/send?access_token=REPLACE_ME
+
+# ── 路由策略：所有告警默认走邮件 ────────────────────────────────────
+policies:
+  - orgId: 1
+    receiver: email-receiver
+    group_by:
+      - grafana_folder
+      - alertname
+    group_wait: 10s
+    group_interval: 1m
+    repeat_interval: 30m
+
+# ── 告警规则 ────────────────────────────────────────────────────────
+groups:
+  - orgId: 1
+    name: seckill-mq
+    folder: hmdp-seckill
+    interval: 30s
+    rules:
+      # 规则一：秒杀死信产生（重试链放弃，等待对账兜底）
+      # 查询用 `or vector(0)`：Micrometer Counter 在首次打点前不存在，
+      # 不补 0 的话规则会永远停在 NoData 态；补 0 则「无死信=Normal」。
+      - uid: hmdp-dlq-alert
+        title: 秒杀死信：订单消息重试耗尽（等待对账兜底）
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: hmdp-prom
+            model:
+              datasource:
+                type: prometheus
+                uid: hmdp-prom
+              editorMode: code
+              expr: sum(increase(hmdp_order_dead_letter_total[5m])) or vector(0)
+              instant: true
+              intervalMs: 1000
+              legendFormat: __auto
+              maxDataPoints: 43200
+              range: false
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: B
+              type: threshold
+        for: 0s
+        noDataState: NoData
+        execErrState: Error
+        annotations:
+          summary: "过去 5 分钟产生 {{ $values.B }} 条秒杀死信，重试链已放弃"
+          description: "订单消息消费失败超过 maxReconsumeTimes=5，Broker 已转入 %DLQ%order-consumer-group。业务不丢单（对账任务分钟级关单/补单/库存重算兜底），但需排查消费失败根因：MQ 不可用 / DB 熔断中 / 消费逻辑异常。排查入口：Grafana 面板「熔断与降级」、ERROR 日志按 msgId/traceId 检索。"
+        labels:
+          severity: warning
+          source: mq-dlq
+        isPaused: false

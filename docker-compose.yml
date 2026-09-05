@@ -1,38 +1,26 @@
-# hmdp-pro 依赖中间件（MySQL / Redis）
+# hmdp-pro 依赖中间件（MySQL / Redis / RocketMQ / Prometheus / Grafana）
 #
-# 用法：
+# 常用命令：
 #   docker compose up -d                 # 全量启动
-#   docker compose up -d mysql           # 只起数据库
-#   docker compose logs -f mysql         # 看初始化日志（首次会导入 db/ 下的 SQL）
-#   docker compose down                  # 停止并移除容器（数据卷保留）
-#   docker compose down -v               # 连数据卷一起删（下次启动重新跑初始化）
+#   docker compose up -d mysql redis     # 只起业务中间件（观测栈可选，互不依赖）
+#   docker compose down -v               # 连数据卷一起删（改了 db/ 下的 SQL 后必须这样重跑初始化）
 #
 # 注意：
-#   1. 宿主机 3306 已被本机 MySQL 服务占用，容器内 3306 映射到宿主机 3307。
-#      应用连接请改 url 端口，或停掉本机 MySQL 后把映射改回 3306:3306。
-#   2. /docker-entrypoint-initdb.d 只在数据卷为空的首次启动执行，按文件名升序导入：
-#        hmdp-schema.sql  → 建表
-#        hmdp-seed-data.sql → 种子数据
-#        worker_node.sql    → UidGenerator worker 节点表
-#      改了 SQL 想重跑，必须先 `docker compose down -v`。
-#   3. prometheus / grafana 是可选的观测栈，与业务中间件互不依赖：
-#        docker compose up -d mysql redis prometheus grafana
-#      只起中间件就 `docker compose up -d mysql redis`。
-#      Prometheus 抓的是**宿主机**上的应用（host.docker.internal:8081），
-#      不是容器内的应用，所以应用要在宿主机跑起来才有数据。
-#      端口：9090=Prometheus、3000=Grafana（admin/admin）。
-#      3000 若被前端 dev server 占用，把映射改成 "3001:3000"。
+#   1. 宿主机 3306 被本机 MySQL 占用，映射到 3307，应用连接 url 需同步改端口
+#   2. /docker-entrypoint-initdb.d 仅在数据卷为空的首次启动执行（schema → seed → worker_node 按文件名序）
+#   3. Prometheus 抓宿主机应用（host.docker.internal:8081），应用须在宿主机运行才有数据。
+#      端口：9090=Prometheus、3000=Grafana（admin/admin，被占用就改映射）
 
 services:
   mysql:
     image: mysql:8.0
-    # 不写死 container_name：避免与工作区副本（E:/Project/hmdp-pro）里的 hmdp-mysql 撞名
+    # 不写死 container_name：避免与工作区副本里的 hmdp-mysql 撞名
     environment:
       MYSQL_ROOT_PASSWORD: "123456"
       MYSQL_DATABASE: hmdp
       TZ: Asia/Shanghai
     command:
-      # mysql_native_password：项目 mysql-connector 5.1.47 不支持 8.0 默认的 caching_sha2_password
+      # mysql-connector 5.1.47 不支持 8.0 默认的 caching_sha2_password
       - --default-authentication-plugin=mysql_native_password
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_general_ci
@@ -53,18 +41,9 @@ services:
       - "6379:6379"
     volumes:
       - redis-data:/data
-    # maxmemory-policy 说明：
-    #   默认 noeviction 在内存打满后直接拒绝写（登录/秒杀全挂），必须显式配。
-    #   选 volatile-lru（只驱逐【设了过期时间】的 key），而不是 allkeys-lru：
-    #     - 缓存类 key（商铺缓存 / 空值标记 / 排队状态 / 事务标记）都带 TTL，
-    #       被逐最多回源 DB 或重查，语义无损 —— 它们是天然的淘汰候选。
-    #     - 秒杀库存 seckill:stock:* 与下单用户集合 seckill:order:* 不带 TTL，
-    #       volatile-lru 永不驱逐它们。这点很关键：库存被逐 = 库存凭空消失，
-    #       Lua 判 stock==nil 会让秒杀全部失败；更糟的是若此时按 DB 值回填
-    #       （而 DB 落后于 Redis）会直接超卖。
-    #   代价：若内存打满时剩余的全是无 TTL key，写会被拒绝（退化成 noeviction）。
-    #   本项目有 TTL 的 key 占绝大多数，256mb 足够，可接受。
-    #   生产进一步加固：把不可丢数据拆到独立实例，配 noeviction + 合理 maxmemory。
+    # volatile-lru 而非 allkeys-lru：seckill:stock:* / seckill:order:* 无 TTL，绝不能被驱逐
+    # （库存被逐 = 凭空消失；若再按落后的 DB 值回填会超卖）。其余 key 都带 TTL，是天然淘汰候选。
+    # 生产加固：不可丢数据拆独立实例 + noeviction + 合理 maxmemory
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy volatile-lru
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -76,7 +55,7 @@ services:
     image: prom/prometheus:v2.53.0
     ports:
       - "9090:9090"
-    # 让容器能解析 host.docker.internal → 宿主机（Linux 靠 host-gateway，Docker Desktop 亦然）
+    # Linux 下靠 host-gateway 让容器解析宿主机（Docker Desktop 亦然）
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -101,8 +80,18 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: admin
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_DASHBOARDS_MIN_REFRESH_INTERVAL: 5s
+      # ── SMTP 发信（告警邮件出口）─────────────────────────────────────
+      # QQ 邮箱示例：设置 → 账号 → 开启 IMAP/SMTP 服务 → 生成授权码（填授权码，非登录密码）
+      # 163 邮箱：GF_SMTP_HOST=smtp.163.com:465；Gmail：smtp.gmail.com:587 + 应用专用密码
+      GF_SMTP_ENABLED: "true"
+      GF_SMTP_HOST: smtp.qq.com:465
+      GF_SMTP_USER: REPLACE_ME@qq.com
+      GF_SMTP_PASSWORD: REPLACE_ME_AUTH_CODE
+      GF_SMTP_FROM_ADDRESS: REPLACE_ME@qq.com
+      GF_SMTP_FROM_NAME: hmdp-pro-alert
+      GF_SMTP_SKIP_VERIFY: "true"
     volumes:
-      # provisioning 目录自动导入数据源与面板，起容器即可用，不用手点
+      # provisioning 自动导入数据源与面板，起容器即可用
       - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
@@ -114,15 +103,14 @@ services:
       timeout: 5s
       retries: 30
 
-  # 版本与 pom.xml 里的 rocketmq-client 保持一致（4.9.7），
-  # 客户端与 Broker 跨大版本可能出现协议不兼容
+  # 版本与 pom.xml 的 rocketmq-client 保持一致（4.9.7），跨大版本可能协议不兼容
   rocketmq-namesrv:
     image: apache/rocketmq:4.9.7
     ports:
       - "9876:9876"
     environment:
-      # 默认 JVM 堆太大，开发机扛不住，显式压下来
-      JAVA_OPT_EXT: "-Xms512m -Xmx512m -Xmn256m"
+      # 堆显式压小（开发机）；-XX:-UseContainerSupport 见 broker 注释
+      JAVA_OPT_EXT: "-Xms512m -Xmx512m -Xmn256m -XX:-UseContainerSupport"
     command: sh mqnamesrv
     volumes:
       - rocketmq-namesrv-data:/home/rocketmq/logs
@@ -140,18 +128,22 @@ services:
       - "10912:10912"
     environment:
       NAMESRV_ADDR: rocketmq-namesrv:9876
-      JAVA_OPT_EXT: "-Xms1g -Xmx1g -Xmn512m"
-    # 用数组形式：字符串形式可能被整体当成单个参数（表现为无日志退出 253）
-    # brokerIP1 的取值见 docker/rocketmq/broker.conf 顶部注释
+      # -XX:-UseContainerSupport 是必需项：镜像自带 JDK 8u372 在 Docker Desktop(WSL2) cgroup v2 下
+      # 探测抛 NPE → 消费全部 NoClassDefFoundError 且 broker 无 ERROR 日志，表现为「能发不能收」
+      # （producer 全部成功、offset 正常、consumer 一条收不到）。堆已显式固定，关闭容器感知无副作用
+      JAVA_OPT_EXT: "-Xms1g -Xmx1g -Xmn512m -XX:-UseContainerSupport"
+    # command 必须用数组形式：字符串形式会被整体当成单个参数（无日志退出 253）
     command: ["sh", "mqbroker", "-n", "rocketmq-namesrv:9876", "-c", "/home/rocketmq/conf/broker.conf"]
     volumes:
       - ./docker/rocketmq/broker.conf:/home/rocketmq/conf/broker.conf:ro
-    # store 必须用 tmpfs，不能挂数据卷：
-    # RocketMQ 用 mmap 读写 commitlog，Docker Desktop 的挂载卷（gRPC-FUSE）不支持，
-    # 表现为 broker 无日志退出 253 —— 排查了很久才定位到，别再改回数据卷。
-    # 代价是重启后消息丢失，本地开发无所谓。
+    # store 只能用 tmpfs（uid=3000 必须显式指定）：
+    #   - 挂载卷一律退出 253：RocketMQ 的 commitlog mmap 不被 Docker Desktop 卷支持
+    #     （已排除 cgroup bug / 卷属主两个假设，勿重复排查）
+    #   - 不指定 uid 时 tmpfs 由 root 创建 → broker 卡 store/lock 权限后退出 253，
+    #     stdout 正常、真异常只在容器内 broker.log（Failed to initialize），极具迷惑性
+    #   - 代价：broker 重启丢 topic/位点/消息 → 之后必须重启应用（消费者会因 topic 不存在丢前几单）
     tmpfs:
-      - /home/rocketmq/store
+      - /home/rocketmq/store:uid=3000,gid=3000
     depends_on:
       - rocketmq-namesrv
     healthcheck:
