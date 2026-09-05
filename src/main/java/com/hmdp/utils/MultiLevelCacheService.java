@@ -87,7 +87,7 @@ public class MultiLevelCacheService {
      * Retry 在 CircuitBreaker 外层，如果把 Retry 和 fallback 放同一个方法，
      * fallback 会把异常"消化"成正常返回，Retry 一次也触发不了；分层后顺序变成
      * 熔断(外) → 重试(内) → 缓存查询，两次重试都失败才交给外层熔断 + 降级回源。
-     * 写路径绝不加 Retry（下单重试可能重复扣库存）。
+     * 写路径绝不加 Retry（领券重试可能重复扣库存）。
      *
      * @param keyPrefix Redis key 前缀
      * @param id        业务 ID

@@ -50,7 +50,7 @@ import static com.hmdp.utils.RedisConstants.*;
  * 服务实现类
  * </p>
  *
- * <p><b>秒杀只有一条写路径</b>（原方案 B 已删除，理由见 {@link SeckillMode}）：
+ * <p><b>领券只有一条写路径</b>（原方案 B 已删除，理由见 {@link SeckillMode}）：
  * 入口 Lua 原子预扣 Redis 库存 + 一人一单 → 事务消息 → 消费者落库。
  *
  * @author 虎哥
@@ -154,7 +154,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             return normalized;
         } catch (Exception e) {
             // 读失败沿用上一快照继续用（默认 FULL，行为最保守），1s 内不再重读。
-            // 测试开关读失败不应阻断下单/落库主流程。
+            // 测试开关读失败不应阻断领券/落库主流程。
             protectionSnapshot = new ModeSnapshot(snapshot.mode, now + PROTECTION_RETRY_BACKOFF_MILLIS);
             log.warn("档位开关读取失败，沿用上一快照 {}（3s 缓存语义）", snapshot.mode, e);
             return snapshot.mode;
@@ -207,7 +207,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 locked = false;
             }
             if (!locked) {
-                log.error("不允许重复下单！");
+                log.error("不允许重复领取！");
                 return;
             }
         }
@@ -216,7 +216,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             if (legacy) {
                 int count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
                 if (count > 0) {
-                    log.error("不允许重复下单！");
+                    log.error("不允许重复领取！");
                     return;
                 }
             }
@@ -291,7 +291,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     }
 
     /**
-     * 秒杀入口（P1 容错）：
+     * 领券入口（P1 容错）：
      * <ul>
      *   <li>{@code @Bulkhead(seckillBulkhead)}：信号量 100（Tomcat 200 线程的一半），
      *       maxWait=0 许可耗尽立即拒——排队只会让延迟不可控，不如快速失败。</li>
@@ -299,7 +299,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      *       熔断打开后新请求不再触碰 Redis，直接 503「活动火爆，请稍后」。</li>
      * </ul>
      * 降级语义 = <b>fail-closed</b>：无论哪个层拒绝（舱壁满 / 熔断打开 / Redis 不可用），
-     * 都只能拒绝下单，绝不能放行——不超卖证明唯一依赖 Redis Lua 的原子扣减，
+     * 都只能拒绝领取，绝不能放行——不超卖证明唯一依赖 Redis Lua 的原子扣减，
      * Redis 挂了还放行 = 拆掉正确性屏障，直接超卖。
      * 两个异常（舱壁满 / 熔断打开）由全局异常处理器统一转成 503 + SYS_BUSY。
      */
@@ -351,7 +351,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 reason = SeckillMetrics.Reason.MQ_SEND_ERROR;
                 // 不上抛是有意的：seckillVoucher 外层套着 redisBreaker，MQ 故障的异常穿过去
                 // 会被误记成 Redis 失败，把爆炸半径扩散到健康依赖。转成业务响应
-                // （200 + code=5004「下单通道暂时不可用」），redisBreaker 一个失败都不多记。
+                // （200 + code=5004「领取通道暂时不可用」），redisBreaker 一个失败都不多记。
                 return Result.fail(e.getErrorCode(), e.getMessage());
             } catch (Exception e) {
                 log.error("事务消息发送异常, userId={}, voucherId={}", userId, voucherId, e);
@@ -367,7 +367,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 writeQueueStatusSafe(orderId, SeckillMode.QUEUE_WAITING);
                 // 落库降级语义（P2 关键决策）：Lua 成功只代表 Redis 预扣成功，订单此刻尚未落库，
                 // 要等消费者落库。dbBreaker 打开/半开 = 落库遥遥无期——这时返回"成功"是在撒谎，
-                // 用户会看到「下单成功但订单消失」。说谎的降级比明确的报错更糟：
+                // 用户会看到「领取成功但订单消失」。说谎的降级比明确的报错更糟：
                 // 诚实返回 ORDER_PROCESSING（业务码 1100），并把 orderId 放进 data
                 // ——没有 orderId 前端就无从查询后续结果。
                 if (dbDegraded()) {
@@ -397,7 +397,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     }
 
     /**
-     * 秒杀落库结果查询（降级轮询用）。
+     * 领券落库结果查询（降级轮询用）。
      *
      * <p><b>三级短路，越靠前越便宜：</b>
      * <ol>
@@ -490,15 +490,15 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     }
 
     /**
-     * 排队状态是给前端轮询的旁路数据，不是下单的必要条件。
+     * 排队状态是给前端轮询的旁路数据，不是领取的必要条件。
      * 写失败只记日志——绝不能让一次 Redis 抖动把已经预扣成功的订单变成失败，
-     * 那样会白白少卖，且用户侧完全无感（他以为没抢到）。
+     * 那样会白白少卖，且用户侧完全无感（他以为没领到）。
      */
     private void writeQueueStatusSafe(Long orderId, String status) {
         try {
             writeQueueStatus(orderId, status);
         } catch (Exception e) {
-            log.warn("排队状态写入失败，不影响下单结果, orderId={}, status={}", orderId, status, e);
+            log.warn("排队状态写入失败，不影响领取结果, orderId={}, status={}", orderId, status, e);
         }
     }
 

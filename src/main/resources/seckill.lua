@@ -19,17 +19,17 @@ if stock == nil or stock <= 0 then
     -- 3.2.库存不足，返回1
     return 1
 end
--- 3.2.判断用户是否下单 SISMEMBER orderKey userId
+-- 3.2.判断用户是否领取 SISMEMBER orderKey userId
 if(redis.call('sismember', orderKey, userId) == 1) then
-    -- 3.3.存在，说明是重复下单，返回2
+    -- 3.3.存在，说明是重复领取，返回2
     return 2
 end
 -- 3.4.扣库存 incrby stockKey -1
 redis.call('incrby', stockKey, -1)
--- 3.5.下单（保存用户）sadd orderKey userId
+-- 3.5.领取（保存用户）sadd orderKey userId
 redis.call('sadd', orderKey, userId)
--- 3.6.认领映射：记录该用户抢到的原始 orderId，供对账补单复用订单号
---     （换号补单会让用户轮询旧单号永远 NOT_FOUND——「抢到了但订单消失」）。
+-- 3.6.认领映射：记录该用户领到的原始 orderId，供对账补单复用订单号
+--     （换号补单会让用户轮询旧单号永远 NOT_FOUND——「领到了但订单消失」）。
 --     TTL 1209600s = 14d（对应 RedisConstants.SECKILL_CLAIM_TTL_SECONDS），每次写滑动续期。
 --     注意：stockKey/orderKey 绝不能加 TTL——长活动静默超期后 key 过期，warmUpStock 的
 --     beginMillis 守卫会 fail-closed 拒绝回填，活动将永久「库存不足」；key 生命周期

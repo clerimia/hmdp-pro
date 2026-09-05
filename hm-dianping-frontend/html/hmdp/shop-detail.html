@@ -219,10 +219,10 @@
           return;
         }
         let id = v.id;
-        // 秒杀抢购
+        // 领券
         axios.post("/voucher-order/seckill/" + id)
         .then(({data}) => {
-          // 抢购成功，这里输出订单id，支付功能TODO
+          // 领取成功，这里输出订单id
           this.$message.success("抢购成功，订单id：" + data)
         })
         .catch(this.$message.error)

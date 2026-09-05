@@ -63,8 +63,8 @@ RingBuffer，取号无锁 CAS；DB 短暂不可用时 RingBuffer 余量即天然
 
 ### 关键错误码
 
-- `ORDER_STOCK_OUT`（库存不足）、`ORDER_REPEAT`（重复下单）：业务码，不熔断
-- `ORDER_PROCESSING`（下单处理中）：**降级专用**，见第 7 节语义决策
+- `ORDER_STOCK_OUT`（库存不足）、`ORDER_REPEAT`（重复领取）：业务码，不熔断
+- `ORDER_PROCESSING`（领取处理中）：**降级专用**，见第 7 节语义决策
 - `SYS_REDIS_UNAVAILABLE`、`SYS_MQ_UNAVAILABLE`、`SYS_DB_UNAVAILABLE`、`SYS_BUSY`（熔断/隔离）
 
 ## 5. 三个熔断实例（P1/P2）
@@ -143,10 +143,10 @@ R4J 默认顺序（数字小的在外层）：Retry → CircuitBreaker → RateL
 
 ### 降级矩阵
 
-| 故障 | 秒杀下单 | 商铺/券查询 | 非核心写入 |
+| 故障 | 秒杀领券 | 商铺/券查询 | 非核心写入 |
 |---|---|---|---|
 | Redis 挂 | **fail-closed**：「活动火爆，请稍后」 | 回源 DB（带保护） | 本地缓存读，写入暂缓 |
-| MySQL 挂 | 仍可接单，返回「下单处理中」 | Caffeine L1 顶住 | 不受影响 |
+| MySQL 挂 | 仍可接单，返回「领取处理中」 | Caffeine L1 顶住 | 不受影响 |
 | MQ 挂 | 直接 fail | 不受影响 | 异步写暂缓，靠对账 |
 
 ### 语义决策一：秒杀降级只能是"拒绝"，不能是"放行"
@@ -158,7 +158,7 @@ Mode A 的不超卖证明唯一依赖 Redis Lua 的原子扣减。Redis 挂了�
 
 当前 `VoucherOrderServiceImpl:309` 在 Lua 返回 0 时直接 `Result.ok(orderId)`，但此刻订单尚未落库
 （Redis 预扣成功 + 事务消息已提交）。DB 持续不可用时订单靠对账补，对账也失败则用户看到
-"下单成功但订单消失"。降级设计：`dbBreaker` 打开时返回 `code=ORDER_PROCESSING`。
+"领取成功但订单消失"。降级设计：`dbBreaker` 打开时返回 `code=ORDER_PROCESSING`。
 **说谎的降级比明确的报错更糟。**
 
 ### R4J fallback 硬规则

@@ -7,7 +7,7 @@ public class RocketMQConstants {
 
     public static final String NAME_SERVER = "127.0.0.1:9876";
 
-    /** 秒杀订单 Topic */
+    /** 领券订单 Topic */
     public static final String ORDER_TOPIC = "order-seckill-topic";
     /** 创建订单消息 Tag */
     public static final String ORDER_TAG_CREATE = "CREATE";

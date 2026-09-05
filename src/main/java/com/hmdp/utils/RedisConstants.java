@@ -26,7 +26,7 @@ public class RedisConstants {
     /**
      * 原订单号认领映射（hash：voucherId → {userId: orderId}），Lua 与扣库存同脚本原子写入。
      * 对账补单据此复用用户入口拿到的原 orderId——换新号补单会让用户轮询旧单号永远 NOT_FOUND
-     * （表现为「抢到了但订单消失」）。TTL 14d 由 Lua 每次写滑动续期，覆盖 7d 对账补单窗口；
+     * （表现为「领到了但订单消失」）。TTL 14d 由 Lua 每次写滑动续期，覆盖 7d 对账补单窗口；
      * 超过 14d 且静默期超 14d 的活动会退化为新号补单（与存量数据同路径）。
      */
     public static final String SECKILL_CLAIM_KEY = "seckill:claim:";

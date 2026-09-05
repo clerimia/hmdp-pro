@@ -28,7 +28,7 @@ import static com.hmdp.utils.RedisConstants.SECKILL_STOCK_KEY;
  * <p><b>最关键的约束——库存回填只在活动开始前安全。</b>
  * 活动开始后，Redis 里的库存是唯一真相：入口 Lua 已扣减、但订单还在 MQ 里排队没落库，
  * 此时 DB 的 {@code stock} 是「落后于 Redis 的最终账本」。若拿 DB 值回填 Redis，
- * 等于把已扣掉的库存又加回去 —— 直接超卖。所以这里宁可让秒杀失败，也绝不回填。
+ * 等于把已扣掉的库存又加回去 —— 直接超卖。所以这里宁可让领券失败，也绝不回填。
  */
 @Slf4j
 @Service

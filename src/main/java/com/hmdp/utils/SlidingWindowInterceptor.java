@@ -14,7 +14,7 @@ import javax.servlet.http.HttpServletResponse;
 import java.nio.charset.StandardCharsets;
 
 /**
- * 业务层滑动窗口限流：秒杀相关接口按 userId 限流（需在登录拦截器之后）。
+ * 业务层滑动窗口限流：领券相关接口按 userId 限流（需在登录拦截器之后）。
  *
  * <p><b>两类请求各算各的配额，互不占用：</b>
  * <table>
@@ -44,7 +44,7 @@ public class SlidingWindowInterceptor implements HandlerInterceptor {
     @Value("${seckill.rate-limit.sliding-window.enabled:true}")
     private boolean enabled;
 
-    // ---- 下单动作：严格 ----
+    // ---- 领券动作：严格 ----
     @Value("${seckill.rate-limit.sliding-window.window-ms:1000}")
     private long windowMs;
 
@@ -104,7 +104,7 @@ public class SlidingWindowInterceptor implements HandlerInterceptor {
         } catch (Exception e) {
             // 限流器 fail-open：限流是保护手段而不是业务依赖，它自己故障不能把主链路一起拖死。
             // 但必须计数 —— 这个指标就是「系统正在裸奔」的告警信号。
-            // （业务层仍是 fail-closed：库存不足、重复下单一律拒绝）
+            // （业务层仍是 fail-closed：库存不足、重复领取一律拒绝）
             log.error("滑动窗口限流异常，fail-open 放行, userId={}, uri={}", userId, uri, e);
             seckillMetrics.rateLimitFallback("fail_open");
             return true;

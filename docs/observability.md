@@ -28,7 +28,7 @@ MDC 底层是 `ThreadLocal`，跨线程和跨进程都会断，所以每个边�
 | --- | --- | --- |
 | HTTP 入口 | `observability/TraceIdFilter`（注册见 `config/ObservabilityConfig`，order = HIGHEST_PRECEDENCE） | 请求头 `X-Trace-Id` |
 | 线程池 | `observability/MdcTaskDecorator` → `traceAwareExecutor` | MDC 快照（`submit()` 时刻捕获） |
-| MQ 发送 | `observability/MqTraceCarrier#inject`（3 个 send 方法） | 消息 `properties` |
+| MQ 发送 | `observability/MqTraceCarrier#inject`（事务消息 send 方法） | 消息 `properties` |
 | MQ 消费 / 事务回查 | `mq/OrderMQConsumer`、`mq/SeckillTransactionListener#checkLocalTransaction` | 消息 `properties`（重试带 `-r{n}` 后缀） |
 
 **包结构约定**：`com.hmdp.observability` 只放能力类（上下文门面、埋点门面、边界适配器），
@@ -58,9 +58,12 @@ Timer `hmdp.seckill.latency` → `hmdp_seckill_latency_seconds_*`。
 | `hmdp.seckill.result` | Counter | `mode` `result` `reason` | 秒杀 A/B 各分支、被限流拦截的请求 |
 | `hmdp.seckill.latency` | Timer | `mode` `result` | 秒杀方案 A/B 方法耗时 |
 | `hmdp.ratelimit.fallback` | Counter | `strategy` | 限流器自身异常 → `fail_open` 放行 |
-| `hmdp.order.consume` | Counter | `tag` `result` | MQ 消费 CREATE / TIMEOUT 结果 |
-| `hmdp.order.timeout_send_error` | Counter | — | 超时关单延迟消息发送失败（已记入 Redis 重试集合，对账任务重发） |
+| `hmdp.order.consume` | Counter | `tag` `result` | MQ 消费 CREATE 结果（TIMEOUT 分支已随关单域删除，现仅 CREATE） |
 | `hmdp.order.dead_letter` | Counter | — | 订单消息超重试上限落入死信 topic（等待对账/人工介入） |
+| `hmdp.reconcile.round` | Counter | `outcome`(completed/skipped_supplement/skipped_lock) | 对账轮次心跳，每轮调度至多 +1：抢不到分布式锁 / 补过单或补单异常跳过重算 / 两步都走完 |
+| `hmdp.reconcile.step` | Counter | `step`(supplement/restock) `result`(ok/error) | 对账步骤级成败；`error` = 被 runStep 吞掉的那个异常 |
+| `hmdp.reconcile.supplement` | Counter | `result`(ok/error) | 补发动作次数——同一笔丢单收敛前会重复计数，**不是丢单笔数**；丢单明细看带 voucherId 的日志 |
+| `hmdp.reconcile.restock` | Counter | `result`(adjusted/converged) | 库存重算判定，每轮每张在窗券恰好 +1；`adjusted` 递增 = 发生过漂移并已改写 |
 | `hmdp.cache.rebuild` | Counter | `result` | 缓存异步重建结果 |
 | `hmdp.cache.hit` | Counter | `level`(l1/l2/db) | 多级缓存命中层级分布 |
 | `hmdp.seckill.degraded` | Counter | `breaker` `reason` | 秒杀降级量（dbBreaker 打开 → `db_degraded`；mqBreaker 打开 → `mq_send_error`），与 result 的 reason 同口径 |
@@ -71,11 +74,11 @@ Timer `hmdp.seckill.latency` → `hmdp_seckill_latency_seconds_*`。
 
 `reason` 取值封闭在 `SeckillMetrics.Reason` 枚举里：
 `success` / `stock_out` / `repeat` / `rate_limited` / `mq_send_error` / `db_degraded` / `system_error`。
-（`db_degraded` = dbBreaker 打开/半开时入口诚实返回「下单处理中」，P2 落库降级语义。）
+（`db_degraded` = dbBreaker 打开/半开时入口诚实返回「领取处理中」，P2 落库降级语义。）
 
 ### tag 使用红线
 
-**绝不能用 `orderId` / `userId` / `traceId` 当 tag。** Prometheus 里每个唯一的 tag 组合都是一条
+**绝不能用 `orderId` / `userId` / `voucherId` / `shopId` / `traceId` 当 tag。**（对账最容易想加的就是 `voucherId`——排查时最想要的就是它，但它只能进日志；红线收口在 `ObservabilityRecorder#increment` 的 javadoc） Prometheus 里每个唯一的 tag 组合都是一条
 独立时间序列，高基数值会同时打爆采集端内存和查询。单笔明细用带 traceId 的日志查，不归指标管。
 
 ## 4. 埋点纪律
@@ -93,7 +96,7 @@ Timer `hmdp.seckill.latency` → `hmdp_seckill_latency_seconds_*`。
 | ① traceId 生成策略 | `UuidTraceIdGenerator`（32 位无横线 UUID） | 注册自己的 `TraceIdGenerator` Bean，`config/ObservabilityConfig` 里挂了 `@ConditionalOnMissingBean` 会自动让位 |
 | ② 跨进程载体 | `MqTraceCarrier`（RocketMQ properties）/ Filter（HTTP header） | 换 Kafka、加 gRPC 时新增 carrier，`inject/extract` 签名不变，业务调用点不动 |
 | ③ 埋点后端 | `MicrometerRecorder`（Prometheus） | 实现 `ObservabilityRecorder` 接口（换 OTel 只改实现类）；压测时 `hmdp.observability.metrics.enabled=false` 自动切 `NoOpRecorder` |
-| ④ 事件集合 | `SeckillMetrics` / `CacheMetrics` / `ResilienceMetrics` | 加方法即可，指标名与合法 tag 值集中在这些类里 |
+| ④ 事件集合 | `SeckillMetrics` / `CacheMetrics` / `ReconcileMetrics` / `ResilienceMetrics` | 加方法即可，指标名与合法 tag 值集中在这些类里（对账不在请求路径上，与秒杀指标分文件维护口径） |
 
 业务代码只依赖 `ObservabilityRecorder` 和语义化的 `SeckillMetrics` / `CacheMetrics`，
 换任何一层实现都不用改调用点。
@@ -158,6 +161,10 @@ PromQL 速查：
 | 熔断是否打开 | `max by (name, state) (resilience4j_circuitbreaker_state{state=~"open\|half_open"})` |
 | 每分钟降级拒流量 | `sum(increase(hmdp_resilience_breaker_event_total{kind="not_permitted"}[1m])) by (breaker)` |
 | 每分钟秒杀降级量 | `sum(increase(hmdp_seckill_degraded_total[1m])) by (breaker, reason)` |
+| 对账是否在跑（5 分钟无心跳即告警） | `sum(increase(hmdp_reconcile_round_total[5m])) or vector(0)` |
+| 每分钟补发次数 | `sum(rate(hmdp_reconcile_supplement_total[1m])) by (result)` |
+| 是否发生过漂移 | `sum(increase(hmdp_reconcile_restock_total{result="adjusted"}[1h])) or vector(0)` |
+| 对账步骤异常（应恒为 0） | `sum(increase(hmdp_reconcile_step_total{result="error"}[5m])) or vector(0)` |
 
 4. **死信告警（Grafana Unified Alerting，provisioning 自动加载）**：
    `docker/grafana/provisioning/alerting/hmdp-alerting.yml` 定义一条规则——
@@ -228,7 +235,7 @@ while true; do curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" localhost
 | --- | --- | --- |
 | 0~5 次调用（学习期） | 响应约 800ms 失败（Redis 命令超时收敛，不再是 60s 挂起） | `hmdp_resilience_breaker_event_total{breaker="redisBreaker",kind="error"}` 递增 |
 | 失败率 ≥50%（窗口 20/最少 10） | 熔断打开，之后全部请求 ~0ms 快速失败 | `resilience4j_circuitbreaker_state{state="open"}` 变 1；`hmdp_resilience_breaker_transition_total{breaker="redisBreaker",state="open"}` +1 |
-| 打开期间 | 读请求降级回源 DB（受 dbFallbackBulkhead 保护），秒杀返回 503 语义化错误 | `hmdp_resilience_fallback_total{breaker="redisBreaker",kind="not_permitted"}` 递增 |
+| 打开期间 | 读请求降级回源 DB（受 dbFallbackBulkhead 保护），领券返回 503 语义化错误 | `hmdp_resilience_fallback_total{breaker="redisBreaker",kind="not_permitted"}` 递增 |
 | 10s 后 | 自动进半开，放行最多 3 次探测 | `resilience4j_circuitbreaker_state{state="half_open"}` 变 1 |
 
 **恢复观察：**
@@ -252,7 +259,7 @@ docker compose start redis
 
 ```bash
 # 第 1 步：先登录拿 token（前端页面登录，或 /user/code + /user/login 流程）
-# 第 2 步：停 MySQL，持续秒杀（需要库存的秒杀券；带登录态）
+# 第 2 步：停 MySQL，持续领券（需要库存的秒杀券；带登录态）
 docker compose stop mysql
 curl -s -X POST localhost:8081/voucher-order/seckill/{voucherId} -H "authorization: <token>"
 ```
@@ -261,7 +268,7 @@ curl -s -X POST localhost:8081/voucher-order/seckill/{voucherId} -H "authorizati
 
 | 环节 | 现象 | 指标证据 |
 | --- | --- | --- |
-| 入口（Lua 预扣成功后） | 不再谎报成功，返回 `code=1100`（ORDER_PROCESSING「下单处理中」） | `hmdp_seckill_degraded_total{breaker="dbBreaker",reason="db_degraded"}` 递增；`hmdp_seckill_result_total{reason="db_degraded"}` 同步递增 |
+| 入口（Lua 预扣成功后） | 不再谎报成功，返回 `code=1100`（ORDER_PROCESSING「领取处理中」） | `hmdp_seckill_degraded_total{breaker="dbBreaker",reason="db_degraded"}` 递增；`hmdp_seckill_result_total{reason="db_degraded"}` 同步递增 |
 | 消费端 | 落库失败 → RECONSUME_LATER 重投，重试上限后进死信 topic | `hmdp_order_consume_total{result="error"}`、`hmdp_order_dead_letter_total` 递增 |
 | mqBreaker（若 MQ 也受影响） | 事务消息快速失败，返回 5004 | `hmdp_seckill_degraded_total{breaker="mqBreaker",reason="mq_send_error"}` 递增 |
 

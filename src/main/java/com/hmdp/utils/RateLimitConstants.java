@@ -8,7 +8,7 @@ public class RateLimitConstants {
     private RateLimitConstants() {
     }
 
-    /** 业务滑动窗口（秒杀下单）：rate:sw:seckill:{userId} */
+    /** 业务滑动窗口（领券）：rate:sw:seckill:{userId} */
     public static final String SLIDING_WINDOW_SECKILL_KEY = "rate:sw:seckill:";
 
     /**

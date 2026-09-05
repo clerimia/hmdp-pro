@@ -31,7 +31,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * 秒杀订单消费者：消费 CREATE（异步落库）消息
+ * 领券订单消费者：消费 CREATE（异步落库）消息
  * 消费失败返回 RECONSUME_LATER，由 RocketMQ 按重试间隔自动重投，配合业务幂等保证不丢单
  *
  * <p>P2 容错：

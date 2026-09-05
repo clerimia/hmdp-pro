@@ -3,7 +3,7 @@ package com.hmdp.observability;
 import org.springframework.stereotype.Component;
 
 /**
- * 缓存链路指标。与 {@link SeckillMetrics} 分开：商铺缓存不属于秒杀链路，
+ * 缓存链路指标。与 {@link SeckillMetrics} 分开：商铺缓存不属于领券链路，
  * 各自维护指标口径，将来加命中率、穿透率只动这里。
  */
 @Component

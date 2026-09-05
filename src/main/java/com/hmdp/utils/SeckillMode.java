@@ -1,7 +1,7 @@
 package com.hmdp.utils;
 
 /**
- * 秒杀方案标识与排队状态。
+ * 领券方案标识与排队状态。
  *
  * <p><b>曾有过两种写路径（A/B），现只保留 A。</b>
  * 原方案 B 是「入口只限流入队、库存与一人一单校验下沉到消费者」，
@@ -29,7 +29,7 @@ public final class SeckillMode {
     public static final String QUEUE_SUCCESS = "SUCCESS";
     /** 落库时发现库存不足 */
     public static final String QUEUE_FAIL_STOCK = "FAIL_STOCK";
-    /** 落库时发现重复下单 */
+    /** 落库时发现重复领取 */
     public static final String QUEUE_FAIL_REPEAT = "FAIL_REPEAT";
     /** 系统故障导致未能落库 */
     public static final String QUEUE_FAIL_SYSTEM = "FAIL_SYSTEM";

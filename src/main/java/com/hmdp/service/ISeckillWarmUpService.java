@@ -7,7 +7,7 @@ import com.hmdp.dto.SeckillWindow;
  *
  * <p>为什么需要它：库存与活动信息原本只在 {@code addSeckillVoucher} 时写进 Redis，
  * 直接向 DB 插数据（种子数据、运营后台改单）不会产生 Redis key —— 结果是 Lua 里
- * {@code stock == nil} 走「库存不足」分支，秒杀永远失败，且没有任何报错。
+ * {@code stock == nil} 走「库存不足」分支，领券永远失败，且没有任何报错。
  *
  * <p>入口每次调用只多一次 HGETALL（预热完成后），回源只在 key 缺失时发生，
  * 且用分布式锁收敛成一个线程。

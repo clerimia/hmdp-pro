@@ -17,7 +17,7 @@
 | token = 32 位无横线 UUID，存 `login:token:{token}` hash，请求头 `authorization` | `UserServiceImpl#login`、`RefreshTokenInterceptor` | fixture 只需管一个字符串；Redis 侧可直接校验/吊销 |
 | 未登录被 `LoginInterceptor` 拦成 **HTTP 401 且 body 为空** | `LoginInterceptor` | 断言器必须**分 HTTP 层 / 业务层两级**，401 不能去解 body |
 | 业务失败返回 **200 + `code`**，系统故障返回 **503**，限流返回 **429** | `WebExceptionAdvice`、`SlidingWindowInterceptor` | `code` 字段才是业务结论，HTTP 状态码只表达"是否被正确处理" |
-| 秒杀下单限流 **5 次/秒/用户**，key `rate:sw:seckill:{userId}` | `SlidingWindowInterceptor` + `application.yaml` | **并发用例要按用户数铺开，不是按请求数**；且每条用例必须前置清配额 |
+| 领券限流 **5 次/秒/用户**，key `rate:sw:seckill:{userId}` | `SlidingWindowInterceptor` + `application.yaml` | **并发用例要按用户数铺开，不是按请求数**；且每条用例必须前置清配额 |
 | 429 的 body 是 `Result.fail(String)`，**`code` 为 null** | `SlidingWindowInterceptor` | 429 只能靠 status + `errorMsg` 断言，不能断言 `code` |
 | 秒杀落库是**异步**的（RocketMQ 事务消息 → 消费者落库） | `VoucherOrderServiceImpl#seckillVoucher` | 落库断言**必须 eventually 轮询**，禁止 `sleep` 固定秒 |
 | `tb_voucher_order` 有唯一索引 `uk_user_voucher(user_id, voucher_id)` | `hmdp-schema.sql` | 一人一单由 DB 强制；**用例清理不干净，重跑直接 ORDER_REPEAT** |
@@ -89,7 +89,7 @@ common 层（client / db / redis / wait / assertions）
 
 - **api 层**的函数签名是 `f(client, ...) -> ApiResponse`，函数里**只有一次 HTTP 调用**，不 assert、不 sleep、不重试。
 - 唯一例外：api 层可以做**协议级**断言（如"这个接口应当返回 JSON"，解析失败直接抛 `ApiProtocolError`），因为那是 HTTP 契约，不是业务结论。
-- 业务结论（库存不足？重复下单？缓存命中哪一层？）**一律在 case 层**用断言助手表达。
+- 业务结论（库存不足？重复领取？缓存命中哪一层？）**一律在 case 层**用断言助手表达。
 
 > 面试讲法：api 层管"怎么调"，case 层管"期望什么"，common 层管"怎么验"。三层职责不重叠，接口改 URL 只动 api 层一个函数，业务规则变只动 data 层一个 yaml。
 
@@ -322,7 +322,7 @@ def new_seckill_voucher(http, db):
 ```
 
 **纪律二：造数与清理严格对称。**
-teardown 必须删干净，否则重跑直接翻车（`uk_user_voucher` 唯一索引会把第二次下单打成 `ORDER_REPEAT`）：
+teardown 必须删干净，否则重跑直接翻车（`uk_user_voucher` 唯一索引会把第二次领券打成 `ORDER_REPEAT`）：
 ```
 tb_voucher_order（该券的行）→ tb_seckill_voucher → tb_voucher
 Redis: seckill:stock:{vid} / seckill:order:{vid} / seckill:meta:{vid} /
@@ -453,7 +453,7 @@ new_seckill_voucher(shop_id, stock, begin_offset_s, end_offset_s)   # contextman
 
 | # | 坑 | 框架侧的防御 |
 |---|---|---|
-| 1 | 秒杀限流 5 次/秒/用户，上一条用例烧掉配额 → 下一条莫名 429 | 每条秒杀用例开头 `reset_rate_limit`；并发请求数 `> 5` 时强制按用户铺开 |
+| 1 | 领券限流 5 次/秒/用户，上一条用例烧掉配额 → 下一条莫名 429 | 每条领券用例开头 `reset_rate_limit`；并发请求数 `> 5` 时强制按用户铺开 |
 | 2 | 落库异步，立刻查 DB 查不到 | 所有落库断言带 `timeout`，内部 `wait_until` |
 | 3 | 401 空 body，解析 JSON 直接 KeyError | `ApiResponse.body` 允许为 None；`assert_result` 分两层 |
 | 4 | 429 body 的 `code` 是 null | 429 只断言 status + `msg_contains` |

@@ -16,8 +16,12 @@ public interface ObservabilityRecorder {
     /**
      * 事件计数 +1。
      *
-     * @param metric 指标名（点分命名，Prometheus 侧会自动转成 {@code xxx_total}）
-     * @param tags   key,value 交替出现，<b>必须成对</b>；值只能取有限枚举
+     * @param metric 指标名（点分命名，Prometheus 侧会自动转成 {@code xxx_total}；
+     *               自己再带 {@code _total} 后缀会变成 {@code ..._total_total}）
+     * @param tags   key,value 交替出现，<b>必须成对</b>；值只能取有限枚举。
+     *               <p><b>红线</b>：绝不能拿 {@code orderId} / {@code userId} / {@code voucherId}
+     *               / {@code shopId} / {@code traceId} 这类高基数值当 tag——每个唯一组合
+     *               都是一条独立时间序列，会把采集端内存和查询一起打爆。它们只能进日志。
      */
     void increment(String metric, String... tags);
 

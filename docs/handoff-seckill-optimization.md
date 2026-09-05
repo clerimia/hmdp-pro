@@ -4,7 +4,7 @@
 > **第二轮：查询接口收尾 + 端到端验证（挖出 broker「能发不能收」的环境 bug）。**
 > **第三轮：混沌测试 + 索引审计，见 [`docs/chaos-test-report.md`](./chaos-test-report.md)。**
 >
-> **一句话状态：秒杀 + 入库链路端到端跑通，混沌测试通过；支付链路按怡霖要求跳过。**
+> **一句话状态：领券 + 落库链路端到端跑通，混沌测试通过；支付链路已明确移除——不接三方支付，券免费领。**
 
 ---
 
@@ -19,8 +19,8 @@
 | 5 | **修复 broker「能发不能收」的环境 bug** | 见第 3 节，本轮最有价值的发现 |
 | 6 | 复核「store 改挂载卷」方案 | **结论：不可行**，见第 4 节 |
 
-**支付链路（原 Task #7/#8 的 `getPayResult` / `pay/result/{orderId}`）本轮跳过**，代码里没有落地 `PayStatus`、`getPayResult`、controller 端点。
-`SlidingWindowInterceptor` 的 pay 分支与 yaml 的 `pay-window-ms / pay-max-requests` 已就位但未生效（`MvcConfig` 没挂 path），待该接口实现时补一行即可。
+**支付链路（原 Task #7/#8 的 `getPayResult` / `pay/result/{orderId}`）已明确移除**：不接三方支付，券免费领，用户到店线下付钱给商家。
+`SlidingWindowInterceptor` 的 pay 分支与 yaml 的 `pay-window-ms / pay-max-requests` 已于 2026-09-05 的支付域改造中一并删除——不是「待实现时补一行」，这一行永远不会补了。
 
 ---
 
@@ -69,9 +69,9 @@ registry.addInterceptor(slidingWindowInterceptor)
 | 1 | POST `/voucher-order/seckill/11`（未开始） | 活动尚未开始 | ✅ `code=1007` |
 | 2 | POST `/voucher-order/seckill/12`（已结束） | 活动已结束 | ✅ `code=1008` |
 | 3 | GET `seckill/result/{伪orderId}` ×2 | 第二次不打 DB | ✅ 均 `NOT_FOUND`；MySQL general_log 实测 **2 次查询只打 1 次 DB**，Redis 标记 TTL=10 |
-| 4 | POST `/voucher-order/seckill/13`（进行中） | 下单→落库 | ✅ `Result.ok(orderId)`；`WAITING`→`SUCCESS`；DB 落库 `732461317478219776 user=7 voucher=13 status=1`；`stock:13` 50→47 |
-| 5 | 同用户再抢券 13 | 不能重复下单 | ✅ `code=1004` |
-| 9a | 本人查已落库订单（强制走 DB 分支） | SUCCESS | ✅ `SUCCESS + orderStatus=1` |
+| 4 | POST `/voucher-order/seckill/13`（进行中） | 领券→落库 | ✅ `Result.ok(orderId)`；`WAITING`→`SUCCESS`；DB 落库 `732461317478219776 user=7 voucher=13 used=0`；`stock:13` 50→47 |
+| 5 | 同用户再领券 13 | 不能重复领取 | ✅ `code=1004` |
+| 9a | 本人查已落库订单（强制走 DB 分支） | SUCCESS | ✅ `SUCCESS + used=0` |
 | 9b | **换用户 B 查同一 orderId** | NOT_FOUND | ✅ `NOT_FOUND`（归属校验生效） |
 | 10 | 对账任务（60s 一轮） | 券 12 库存收敛 | ✅ 静默跳过（DB 98 / Redis 98 一致） |
 | 限流 | 1 秒内突发 15 次 result 查询 | 前 10 通过 | ✅ `200×10 + 429×5`，应用日志同步出现 5 条限流 WARN |
@@ -86,7 +86,7 @@ registry.addInterceptor(slidingWindowInterceptor)
 
 ### 3.4 🔴 本轮最有价值的发现：broker「能发不能收」
 
-**现象**：下单全部返回成功、Redis 预扣成功、`seckill:txn` 标记写入，但**订单永远不落库**，`WAITING` 不变 `SUCCESS`。
+**现象**：领券全部返回成功、Redis 预扣成功、`seckill:txn` 标记写入，但**订单永远不落库**，`WAITING` 不变 `SUCCESS`。
 
 **排查链**（每一步都有证据，值得记方法论）：
 
@@ -105,7 +105,7 @@ registry.addInterceptor(slidingWindowInterceptor)
 **只影响读（消费者），不影响写（生产者）**，所以表现为"能发不能收"——极具迷惑性。
 
 **修复**：`docker-compose.yml` 的 namesrv 与 broker 的 `JAVA_OPT_EXT` 加 `-XX:-UseContainerSupport`（关闭容器感知跳过该探测；堆已用 `-Xms/-Xmx` 显式固定，无副作用）。
-**验证**：修复后 `queryMsgByOffset` 不再报错，下单 3s 内落库，`Diff → 0`。
+**验证**：修复后 `queryMsgByOffset` 不再报错，领券 3s 内落库，`Diff → 0`。
 
 ### 3.5 🟡 复现出的 P2 缺陷：进行中券丢单无人兜底
 
@@ -130,7 +130,7 @@ broker 重启（tmpfs，消息全丢）导致券 13 有 **2 笔已预扣但消�
   - 假设 A「是 JDK 8u372 cgroup v2 bug」→ 加了 `-XX:-UseContainerSupport` 后命名卷**仍旧 253**，而 tmpfs 正常 ⇒ 两者是独立问题
   - 假设 B「是卷属主权限」→ 镜像里根本没有 `/home/rocketmq/store`，挂空卷后由 root 创建；`chown 3000:3000` 后**仍旧 253**
   - 剩余最可能原因：RocketMQ 对 commitlog 的 mmap 在 Docker Desktop 的挂载卷后端上不被支持
-- **tmpfs 的代价（重要）**：broker 重启后 topic 元数据全丢，topic 要等**首次发送**才被 `autoCreateTopicEnable` 自动创建 → 消费者启动时 topic 不存在 → **重启后前几单消费不到**（本轮实测：下单后等了约 60s 客户端刷新路由才追平）。broker 重启后记得重启应用。
+- **tmpfs 的代价（重要）**：broker 重启后 topic 元数据全丢，topic 要等**首次发送**才被 `autoCreateTopicEnable` 自动创建 → 消费者启动时 topic 不存在 → **重启后前几单消费不到**（本轮实测：领券后等了约 60s 客户端刷新路由才追平）。broker 重启后记得重启应用。
 - **broker 重启后必须手动预建 topic**：事务消息发往 `RMQ_SYS_TRANS_HALF_TOPIC`，**不会触发 autoCreate**，所以重启应用也救不回来，会一直报 `No route info of this topic`。必须：
   ```bash
   docker exec hmdp-pro-rocketmq-broker-1 sh -c \
@@ -143,7 +143,7 @@ broker 重启（tmpfs，消息全丢）导致券 13 有 **2 笔已预扣但消�
 
 ### 4.1 本轮造的测试数据（可安全清理）
 
-券 13 是为跑通「进行中下单」造的，含 2 份 orphan 库存（见 3.5）。要清掉：
+券 13 是为跑通「进行中领券」造的，含 2 份 orphan 库存（见 3.5）。要清掉：
 
 ```sql
 DELETE FROM hmdp.tb_voucher_order WHERE voucher_id = 13;
@@ -166,19 +166,18 @@ docker exec hmdp-pro-redis-1 redis-cli DEL seckill:timeout:retry
 
 ## 5. 遗留事项
 
-1. **支付链路未做**：`getPayResult` / `pay/result/{orderId}` / `PayStatus`。拦截器的 pay 分支与 yaml 配额已就位，实现后往 `MvcConfig` 补一个 path 即生效
+1. **支付链路已明确不做**：不接三方支付，券免费领。拦截器的 pay 分支与 yaml 配额已于 2026-09-05 删除
 2. **前端降级误报成功**：`Result.fail(ORDER_PROCESSING)` HTTP 仍是 200，前端 `.then` 里无脑提示"抢购成功，订单id：[object Object]"。需按 `success/code` 分支展示——待怡霖拍板
-3. **前端无订单页/支付入口**：`shop-detail.html` 的 `seckill()` 注释即"支付功能TODO"；后端也没有订单列表接口
+3. **前端无订单页**：`shop-detail.html` 的 `seckill()` 注释原带"支付功能TODO"（已于 2026-09-05 删除 TODO 部分）；后端也没有订单列表接口
 4. **P2 未做**：
    - 进行中券丢单无人兜底（**已复现，见 3.5，优先级最高**）
-   - `cancelTimeoutOrder` 回补库存非原子
    - 限流 Lua 每次 `UUID.randomUUID()`
 5. **混沌测试新增的待决策项**（详见 `chaos-test-report.md` 第 4 节）：
    - Redis 故障返回 401，文案误导（应区分「无 token」与「Redis 不可用」）
-   - 关单回补不修正 Redis/DB 存量漂移，只能等活动结束后对账重算
+   - Redis/DB 存量漂移不会被任何主路径机制修正，只能等活动结束后由对账按账本统一重算——关单域删除后，这就是唯一设计，不是接受的缺陷
    - `NOT_FOUND` 语义三义（不存在 / 非本人 / 未落库），极端情况会让用户误以为失败
-   - dbBreaker 学习期（10 次调用）内下单仍返回成功
-5. **前端轮询策略**（快-慢-熔断 + 抖动 + 首次延迟 300~500ms）已定稿未实现，依赖支付接口先完成
+   - dbBreaker 学习期（10 次调用）内领券仍返回成功
+5. **前端轮询策略**（快-慢-熔断 + 抖动 + 首次延迟 300~500ms）已定稿未实现——它依赖的是 `GET /voucher-order/seckill/result/{orderId}` 轮询接口，不依赖任何支付接口
 6. 轮询参数备忘：1~3 次 500ms / 4~10 次 2s / 之后 5s / 总超时 30~60s 后停止并提示兜底文案；首次延迟 300~500ms + ±20% 抖动
 
 ---

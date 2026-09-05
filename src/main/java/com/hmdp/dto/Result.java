@@ -55,7 +55,7 @@ public class Result {
     /**
      * 按错误码失败并携带数据。
      *
-     * <p>用于降级场景：秒杀返回 ORDER_PROCESSING 时必须把 orderId 一起回给前端，
+     * <p>用于降级场景：领券返回 ORDER_PROCESSING 时必须把 orderId 一起回给前端，
      * 否则前端拿到一句「处理中」却无从查询后续结果。
      * 注意 HTTP 状态码仍是 200 —— 前端必须判 {@code success/code}，不能只看状态码。
      */

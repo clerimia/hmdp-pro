@@ -12,7 +12,7 @@ import java.time.LocalDateTime;
 
 /**
  * <p>
- * 秒杀优惠券表，与优惠券是一对一关系
+ * 秒杀券表，与优惠券是一对一关系
  * </p>
  *
  * @author 虎哥
@@ -38,7 +38,7 @@ public class SeckillVoucher implements Serializable {
     private Integer stock;
 
     /**
-     * 初始库存（对账账本：秒杀结束库存重算的基准，发布时与 stock 一致）
+     * 初始库存（对账账本：活动结束库存重算的基准，发布时与 stock 一致）
      */
     private Integer initialStock;
 

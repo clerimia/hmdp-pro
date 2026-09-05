@@ -6,7 +6,7 @@ spring:
   datasource:
     driver-class-name: com.mysql.jdbc.Driver
     # serverTimezone 必须与容器 TZ、JVM 默认时区三者一致，否则 timestamp 字段
-    # 会被二次偏移（秒杀活动提前 8 小时开抢）。详见 application-local.yaml 注释。
+    # 会被二次偏移（活动提前 8 小时开抢）。详见 application-local.yaml 注释。
     url: jdbc:mysql://127.0.0.1:3306/hmdp?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
     username: your_mysql_user
     password: your_mysql_password
@@ -15,7 +15,7 @@ spring:
       # 默认 30s：DB 抖动时 Tomcat 线程会全部卡在等连接上，比 DB 本身故障更致命
       connection-timeout: 3000
       # 连接池上限。池子越大 ≠ 吞吐越高：MySQL 侧并发线程切换成本会反噬。
-      # 取 20 = 秒杀入口信号量(100) 的 1/5，保证非秒杀查询仍有连接可用
+      # 取 20 = 领券入口信号量(100) 的 1/5，保证非领券查询仍有连接可用
       maximum-pool-size: 20
   redis:
     host: your_redis_host
@@ -38,7 +38,7 @@ mybatis-plus:
 # ===== RocketMQ 消息队列 =====
 rocketmq:
   name-server: 127.0.0.1:9876
-# ===== 秒杀：入口 Lua 预扣库存与一人一单 + 事务消息异步落库 =====
+# ===== 领券：入口 Lua 预扣库存与一人一单 + 事务消息异步落库 =====
 # （原方案 B「入队后由消费者校验」已删除，理由见 SeckillMode 类注释）
 seckill:
   # 二级限流第二层：业务滑动窗口（第一层在 OpenResty 网关令牌桶）
@@ -50,7 +50,7 @@ seckill:
       max-requests: 5      # 同一用户窗口内最多 5 次领券请求
       # 结果查询（轮询）：单独配额，与领券互不占用（共用一个 key 会让前端
       # 多查几次结果就烧光自己的领券额度）。
-      # 注意轮询规模本身被库存数封顶——只有抢到的人才有 orderId 可查，
+      # 注意轮询规模本身被库存数封顶——只有领到的人才有 orderId 可查，
       # 不存在「几十万人同时轮询」。这道限流真正防的是伪造 orderId 反复查询、
       # 打穿排队状态缓存直落 DB（见 VoucherOrderServiceImpl#getSeckillResult）。
       result-window-ms: 1000
@@ -90,14 +90,14 @@ resilience4j:
         failure-rate-threshold: 50          # 失败率阈值（百分比）
         sliding-window-type: COUNT_BASED    # 按调用次数统计，不看时间分布
         sliding-window-size: 20             # 最近 20 次调用为统计样本
-        # 低于该调用数时不计算失败率：秒杀冷启动时样本太少，
+        # 低于该调用数时不计算失败率：领券冷启动时样本太少，
         # 前两次失败就 100% 会直接熔断，这是 COUNT_BASED 窗口的经典坑
         minimum-number-of-calls: 10
         wait-duration-in-open-state: 10s    # 打开状态持续 10s 后进半开
         automatic-transition-from-open-to-half-open-enabled: true  # 自动进半开，不等下一次调用触发
         # 半开状态下允许的试探调用数：默认 10 太多，一次故障期可能全军覆没才判定
         permitted-number-of-calls-in-half-open-state: 3
-        # 业务异常不计入失败率。库存不足/重复下单是秒杀高峰期最高频的结果，
+        # 业务异常不计入失败率。库存不足/重复领取是领券高峰期最高频的结果，
         # 算进失败率会把健康的依赖误熔断（这是 P0 先建异常体系的原因）
         ignore-exceptions:
           - com.hmdp.exception.BusinessException
@@ -133,10 +133,10 @@ resilience4j:
           - com.hmdp.exception.BusinessException
   bulkhead:
     instances:
-      # 秒杀入口：信号量而非线程池（详见设计文档第 6 节）
+      # 领券入口：信号量而非线程池（详见设计文档第 6 节）
       # 关键：信号量只能拒绝新请求，救不了已卡住的线程 —— 所以 Redis 800ms 超时是它的前置条件
       seckillBulkhead:
-        max-concurrent-calls: 100   # Tomcat 默认 200 线程，秒杀最多占用一半，给查询接口留容量
+        max-concurrent-calls: 100   # Tomcat 默认 200 线程，领券最多占用一半，给查询接口留容量
         max-wait-duration: 0        # 许可耗尽立即拒，排队只会让延迟不可控
       # 缓存查询入口：同理，同步接口用信号量
       cacheBulkhead:
@@ -152,7 +152,7 @@ resilience4j:
   retry:
     instances:
       # 只配在只读幂等路径（缓存查询）。写路径一律不加重试：
-      # 下单重试可能重复扣库存，且 MQ 侧已有 client 重试 + 事务回查 + 对账补单三层兜底。
+      # 领券重试可能重复扣库存，且 MQ 侧已有 client 重试 + 事务回查 + 对账补单三层兜底。
       cacheQueryRetry:
         max-attempts: 2                  # 总共尝试 2 次（首次 + 1 次重试）
         wait-duration: 100ms             # 首次退避 100ms

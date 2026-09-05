@@ -3,7 +3,7 @@ package com.hmdp.observability;
 import org.springframework.stereotype.Component;
 
 /**
- * 秒杀链路的关键事件门面：把「指标名 + tag 名 + 合法取值」集中到一处。
+ * 领券链路的关键事件门面：把「指标名 + tag 名 + 合法取值」集中到一处。
  *
  * <p>业务代码只调用语义化方法（{@code finishSeckill / rateLimitFallback / orderConsumed}），
  * 不直接拼指标名和 tag —— 想新增事件就在这里加一个方法，指标口径不会散落各处。
@@ -30,7 +30,7 @@ public class SeckillMetrics {
         this.recorder = recorder;
     }
 
-    /** 进入秒杀接口（限流之前计数，用于算被限流比例） */
+    /** 进入领券接口（限流之前计数，用于算被限流比例） */
     public void seckillRequested(String mode) {
         recorder.increment(SECKILL_REQUEST, "mode", mode);
     }
@@ -41,7 +41,7 @@ public class SeckillMetrics {
     }
 
     /**
-     * 结束一次秒杀并落结果计数。
+     * 结束一次领券并落结果计数。
      *
      * @param sample 可为 null —— 被限流拦截时请求还没进入业务方法，没有计时句柄
      */
@@ -100,7 +100,7 @@ public class SeckillMetrics {
         ENDED(false, "ended"),
         RATE_LIMITED(false, "rate_limited"),
         MQ_SEND_ERROR(false, "mq_send_error"),
-        /** dbBreaker 打开/半开，落库无期，入口诚实返回「下单处理中」而非成功 */
+        /** dbBreaker 打开/半开，落库无期，入口诚实返回「领取处理中」而非成功 */
         DB_DEGRADED(false, "db_degraded"),
         SYSTEM_ERROR(false, "system_error");
 

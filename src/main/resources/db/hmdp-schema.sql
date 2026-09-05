@@ -113,22 +113,22 @@ CREATE TABLE `tb_voucher`  (
 ) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_general_ci ROW_FORMAT = Compact;
 
 -- ----------------------------
--- 7. 秒杀优惠券表（与 tb_voucher 一对一）
+-- 7. 秒杀券表（与 tb_voucher 一对一）
 -- ----------------------------
 DROP TABLE IF EXISTS `tb_seckill_voucher`;
 CREATE TABLE `tb_seckill_voucher`  (
   `voucher_id` bigint(20) UNSIGNED NOT NULL COMMENT '关联的优惠券的id',
   `stock` int(8) NOT NULL COMMENT '库存',
-  `initial_stock` int(8) NOT NULL DEFAULT 0 COMMENT '初始库存（对账账本：秒杀结束库存重算的基准，发布时与 stock 一致）',
+  `initial_stock` int(8) NOT NULL DEFAULT 0 COMMENT '初始库存（对账账本：活动结束库存重算的基准，发布时与 stock 一致）',
   `create_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   `begin_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '生效时间',
   `end_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '失效时间',
   `update_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
   PRIMARY KEY (`voucher_id`) USING BTREE,
-  -- 对账每轮都要筛「已结束的券」（②补单 与 ③库存重算 各一次），券表虽小但会随运营增长，
+  -- 对账每轮都要筛「已结束的券」（①补单 与 ②库存重算 各一次），券表虽小但会随运营增长，
   -- 且这是每 60s 执行一次的定时任务，全表扫描没有理由保留。
   INDEX `idx_end_time`(`end_time`) USING BTREE
-) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '秒杀优惠券表，与优惠券是一对一关系' ROW_FORMAT = Compact;
+) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '秒杀券表，与优惠券是一对一关系' ROW_FORMAT = Compact;
 
 -- ----------------------------
 -- 8. 优惠券订单表（主键由百度 UidGenerator 生成，非自增）

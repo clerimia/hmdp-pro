@@ -17,7 +17,7 @@ import javax.annotation.Resource;
 import java.nio.charset.StandardCharsets;
 
 /**
- * 秒杀事务消息监听：半消息落盘后执行 Lua；异常未上报时由 Broker 回查事务标记
+ * 领券事务消息监听：半消息落盘后执行 Lua；异常未上报时由 Broker 回查事务标记
  */
 @Slf4j
 @Component
@@ -50,7 +50,7 @@ public class SeckillTransactionListener implements TransactionListener {
             // 库存不足 / 重复：半消息丢弃，不投递
             return LocalTransactionState.ROLLBACK_MESSAGE;
         } catch (Exception e) {
-            log.error("秒杀本地事务执行异常, orderId={}", order.getId(), e);
+            log.error("领券本地事务执行异常, orderId={}", order.getId(), e);
             ctx.setLuaResult(-1);
             // 未知：交给 Broker 回查；若 Lua 未写标记则最终 ROLLBACK
             return LocalTransactionState.UNKNOW;
