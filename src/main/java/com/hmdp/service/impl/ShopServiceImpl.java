@@ -13,7 +13,6 @@ import com.hmdp.utils.SystemConstants;
 import io.github.resilience4j.bulkhead.Bulkhead;
 import io.github.resilience4j.bulkhead.BulkheadFullException;
 import io.github.resilience4j.bulkhead.BulkheadRegistry;
-// 注解 @Bulkhead 与上面的核心类同名，这里用全限定名写在方法上（见 queryById）
 import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import lombok.extern.slf4j.Slf4j;
@@ -34,18 +33,12 @@ import java.util.concurrent.TimeUnit;
 
 import static com.hmdp.utils.RedisConstants.*;
 
-/**
- * <p>
- *  服务实现类
- * </p>
- *
- * @author 虎哥
- * @since 2021-12-22
- */
 @Slf4j
 @Service
 public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IShopService {
 
+    /** 压测对照链路使用裸 Shop JSON，必须与主链路 RedisData 包装格式隔离。 */
+    private static final String BENCHMARK_SHOP_KEY = "cache:shop:benchmark:";
 
     @Resource
     private StringRedisTemplate stringRedisTemplate;
@@ -64,26 +57,25 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     @Resource
     private com.hmdp.observability.ResilienceMetrics resilienceMetrics;
 
+    @Resource
+    private com.hmdp.observability.CacheMetrics cacheMetrics;
+
     /**
-     * 查询入口（P1 容错）：
-     * <ul>
-     *   <li>{@code @Bulkhead(cacheBulkhead)}：信号量 50，许可耗尽立即拒，先在隔离层挡住</li>
-     *   <li>{@code @CircuitBreaker(redisBreaker)}：Redis 失败计入 redisBreaker，打开后快速失败</li>
-     * </ul>
-     * 降级 = 回源 DB。切到新链路的同时必须限流隔离（dbFallbackBulkhead，许可数对齐 Hikari 池 20），
-     * 否则 Redis 挂掉后所有读涌向 DB，降级本身就成了雪崩放大器。
+     * Redis 容错入口。外层 {@code cacheBulkhead} 位于 Controller，本层只处理缓存依赖故障；
+     * 降级回源另由 {@code dbFallbackBulkhead} 限制为 20 个并发，避免故障流量压垮数据库。
      */
-    @io.github.resilience4j.bulkhead.annotation.Bulkhead(name = "cacheBulkhead",
-            type = io.github.resilience4j.bulkhead.annotation.Bulkhead.Type.SEMAPHORE)
     @CircuitBreaker(name = "redisBreaker", fallbackMethod = "queryByIdFallback")
     @Override
     public Result queryById(Long id) {
-        // 多级缓存：Caffeine(L1 JVM) → Redis逻辑过期(L2) → MySQL(L3)
-        // 版本感知：写回前比对快照 update_time 与 DB 当前值，治"成功的脏写"
-        // （读 DB 与写缓存之间的空隙里恰有更新提交并删缓存，旧快照不得回填）
-        Shop shop = multiLevelCache.queryWithMultiLevel(CACHE_SHOP_KEY, id, Shop.class,
-                this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES,
-                Shop::getUpdateTime, shopId -> baseMapper.selectUpdateTimeById(shopId));
+        Shop shop = multiLevelCache.queryWithMultiLevelVersioned(
+                CACHE_SHOP_KEY,
+                id,
+                Shop.class,
+                this::getById,
+                CACHE_SHOP_TTL,
+                TimeUnit.MINUTES,
+                Shop::getUpdateTime,
+                shopId -> baseMapper.selectUpdateTimeById(shopId));
 
         if (shop == null) {
             return Result.fail("店铺不存在！");
@@ -97,17 +89,10 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
      * <p><b>为什么手动获取舱壁许可</b>：fallbackMethod 由 R4J 切面反射直调，
      * 不经过 Spring 代理，方法上的任何注解都不会生效——所以 dbFallbackBulkhead
      * 只能通过 {@link BulkheadRegistry} 手动 tryAcquirePermission（yaml 注释里同样的说明）。
-     *
-     * <p><b>舱壁拒绝不再回源</b>：cacheBulkhead 打回 ≠ Redis 故障。若降级也回源 DB，
-     * 高并发下一半流量被隔离层挡住后又会涌向 DB，隔离层形同虚设。
      */
-    private Result queryByIdFallback(Long id, Throwable t) {
-        if (t instanceof BulkheadFullException) {
-            // cacheBulkhead 打回 ≠ Redis 故障，但也属于「请求没走正常链路」的韧性动作，一并可见
-            resilienceMetrics.fallback("redisBreaker",
-                    com.hmdp.observability.ResilienceMetrics.KIND_BULKHEAD_REJECTED);
-            throw (BulkheadFullException) t;
-        }
+    // Resilience4j 1.7.1 通过反射调用 fallback；保持 public，避免高并发下私有方法
+    // 偶发 IllegalAccessException 被包装成 UndeclaredThrowableException，错误升级为 HTTP 500。
+    public Result queryByIdFallback(Long id, Throwable t) {
         // 降级触发原因：熔断打开（not_permitted）还是学习期真实失败（error）
         resilienceMetrics.fallback("redisBreaker", t instanceof CallNotPermittedException
                 ? com.hmdp.observability.ResilienceMetrics.KIND_NOT_PERMITTED
@@ -131,13 +116,12 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         }
     }
 
-    /**
-     * 黑马原版读路径对照：仅 Redis → MySQL（无 Caffeine / 无网关 L1）
-     */
+    /** 黑马原版读路径对照：仅 Redis → MySQL（无 Caffeine / 无网关 L1） */
     @Override
     public Result queryByIdHeimaRedis(Long id) {
         Shop shop = cacheClient
-                .queryWithPassThrough(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
+                .queryWithPassThrough(BENCHMARK_SHOP_KEY, id, Shop.class, this::getById,
+                        CACHE_SHOP_TTL, TimeUnit.MINUTES);
         if (shop == null) {
             return Result.fail("店铺不存在！");
         }
@@ -151,13 +135,13 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         if (id == null) {
             return Result.fail("店铺id不能为空");
         }
-        // 1.更新数据库。校验影响行数：id 不存在时 updateById 影响 0 行返回 false，
-        //   原实现忽略返回值——对不存在的店铺伪报成功，还触发一次无意义的缓存删除
+        // 校验影响行数：id 不存在时 updateById 影响 0 行返回 false，
+        // 原实现忽略返回值——对不存在的店铺伪报成功，还触发一次无意义的缓存删除
         boolean updated = updateById(shop);
         if (!updated) {
             return Result.fail("店铺不存在！");
         }
-        // 2.事务提交后再失效多级缓存（Caffeine + Redis）：
+        // 事务提交后再失效多级缓存（Caffeine + Redis）：
         //   - 缓存组件故障不应阻断业务主流程（此前写在事务内，Redis 故障会连带业务回滚）；
         //   - 事务回滚时也不会留下「缓存已删 + 库里还是旧值」的错位。
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
@@ -183,9 +167,11 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         for (int i = 0; ; i++) {
             try {
                 multiLevelCache.evict(keyPrefix, id);
+                cacheMetrics.evicted(true);
                 return;
             } catch (Exception e) {
                 if (i >= maxRetries) {
+                    cacheMetrics.evicted(false);
                     log.error("缓存删除失败，等待物理 TTL 兜底, key={}, retries={}",
                             keyPrefix + id, maxRetries, e);
                     return;
@@ -203,21 +189,17 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
     @Override
     public Result queryShopByType(Integer typeId, Integer current, Double x, Double y) {
-        // 1.判断是否需要根据坐标查询
+        // 无坐标：退化为按类型的普通分页查询
         if (x == null || y == null) {
-            // 不需要坐标查询，按数据库查询
             Page<Shop> page = query()
                     .eq("type_id", typeId)
                     .page(new Page<>(current, SystemConstants.DEFAULT_PAGE_SIZE));
-            // 返回数据
             return Result.ok(page.getRecords());
         }
 
-        // 2.计算分页参数
         int from = (current - 1) * SystemConstants.DEFAULT_PAGE_SIZE;
         int end = current * SystemConstants.DEFAULT_PAGE_SIZE;
 
-        // 3.查询redis、按照距离排序、分页。结果：shopId、distance
         String key = SHOP_GEO_KEY + typeId;
         GeoResults<RedisGeoCommands.GeoLocation<String>> results = stringRedisTemplate.opsForGeo() // GEOSEARCH key BYLONLAT x y BYRADIUS 10 WITHDISTANCE
                 .search(
@@ -226,33 +208,27 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
                         new Distance(5000),
                         RedisGeoCommands.GeoSearchCommandArgs.newGeoSearchArgs().includeDistance().limit(end)
                 );
-        // 4.解析出id
         if (results == null) {
             return Result.ok(Collections.emptyList());
         }
         List<GeoResult<RedisGeoCommands.GeoLocation<String>>> list = results.getContent();
+        // 不足一页的偏移量：没有下一页了
         if (list.size() <= from) {
-            // 没有下一页了，结束
             return Result.ok(Collections.emptyList());
         }
-        // 4.1.截取 from ~ end的部分
         List<Long> ids = new ArrayList<>(list.size());
         Map<String, Distance> distanceMap = new HashMap<>(list.size());
         list.stream().skip(from).forEach(result -> {
-            // 4.2.获取店铺id
             String shopIdStr = result.getContent().getName();
             ids.add(Long.valueOf(shopIdStr));
-            // 4.3.获取距离
-            Distance distance = result.getDistance();
-            distanceMap.put(shopIdStr, distance);
+            distanceMap.put(shopIdStr, result.getDistance());
         });
-        // 5.根据id查询Shop
+        // 按 Redis 给出的距离顺序回表，保证结果顺序与 GEO 排序一致
         String idStr = StrUtil.join(",", ids);
         List<Shop> shops = query().in("id", ids).last("ORDER BY FIELD(id," + idStr + ")").list();
         for (Shop shop : shops) {
             shop.setDistance(distanceMap.get(shop.getId().toString()).getValue());
         }
-        // 6.返回
         return Result.ok(shops);
     }
 }

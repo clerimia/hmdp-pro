@@ -4,7 +4,15 @@ public class RedisConstants {
     public static final String LOGIN_CODE_KEY = "login:code:";
     public static final Long LOGIN_CODE_TTL = 2L;
     public static final String LOGIN_USER_KEY = "login:token:";
-    public static final Long LOGIN_USER_TTL = 36000L;
+    /** 登录态采用 30 分钟滑动过期，避免活跃一次后长期有效。 */
+    public static final Long LOGIN_USER_TTL = 30L;
+    public static final String LOGIN_CODE_COOLDOWN_KEY = "login:code:cooldown:";
+    public static final long LOGIN_CODE_COOLDOWN_SECONDS = 60L;
+    public static final String LOGIN_ATTEMPT_KEY = "login:attempts:";
+    public static final String LOGIN_LOCK_KEY = "login:locked:";
+    public static final int LOGIN_MAX_ATTEMPTS = 5;
+    public static final long LOGIN_ATTEMPT_WINDOW_SECONDS = 300L;
+    public static final long LOGIN_LOCK_SECONDS = 300L;
 
     public static final Long CACHE_NULL_TTL = 2L;
 
@@ -15,13 +23,13 @@ public class RedisConstants {
     public static final Long LOCK_SHOP_TTL = 10L;
 
     public static final String SECKILL_STOCK_KEY = "seckill:stock:";
-    /** 秒杀券活动元信息 hash（字段 begin/end = 毫秒时间戳），入口校验活动窗口用 */
+    /** 秒杀券活动元信息 hash（字段 begin/end = 毫秒时间戳） */
     public static final String SECKILL_META_KEY = "seckill:meta:";
-    /** 活动元信息 TTL（小时）：活动信息基本静态，长 TTL 减少回源；到期自动重新预热 */
+    /** 活动信息基本静态，长 TTL 减少回源；到期自动重新预热 */
     public static final long SECKILL_META_TTL_HOURS = 24L;
-    /** 预热互斥锁前缀：缓存击穿时只放行一个线程回源 DB */
+    /** 缓存击穿时只放行一个线程回源 DB */
     public static final String LOCK_SECKILL_WARM_KEY = "lock:seckill:warm:";
-    /** 秒杀成功 claim 用户集合（Lua 脚本 SADD 写入，一人一单与补单差集依据） */
+    /** 秒杀成功 claim 用户集合（Lua SADD 写入，一人一单与补单差集依据） */
     public static final String SECKILL_ORDER_KEY = "seckill:order:";
     /**
      * 原订单号认领映射（hash：voucherId → {userId: orderId}），Lua 与扣库存同脚本原子写入。
@@ -33,11 +41,9 @@ public class RedisConstants {
     public static final long SECKILL_CLAIM_TTL_SECONDS = 1209600L;
     /** RocketMQ 事务消息本地标记（与 Lua 扣库存同脚本写入，回查用） */
     public static final String SECKILL_TXN_KEY = "seckill:txn:";
-    /** 事务标记 TTL（秒），需覆盖 Broker 回查窗口 */
+    /** 需覆盖 Broker 回查窗口 */
     public static final long SECKILL_TXN_TTL_SECONDS = 3600L;
-    /** 方案 B 排队/结果状态 seckill:queue:{orderId} */
     public static final String SECKILL_QUEUE_KEY = "seckill:queue:";
-    /** 排队状态 TTL（分钟） */
     public static final long SECKILL_QUEUE_TTL_MINUTES = 5L;
     /**
      * 排队状态「空值标记」TTL（秒）：查无此单时回写 {@code seckill:queue:{orderId} = NOT_FOUND}，
@@ -48,6 +54,7 @@ public class RedisConstants {
      * 一次轮询会被误标成 NOT_FOUND，短 TTL 让用户等几秒再查就能拿到正确结果。
      */
     public static final long SECKILL_QUEUE_NULL_TTL_SECONDS = 10L;
+
     public static final String BLOG_LIKED_KEY = "blog:liked:";
     public static final String FEED_KEY = "feed:";
     public static final String SHOP_GEO_KEY = "shop:geo:";

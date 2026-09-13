@@ -14,9 +14,10 @@ import org.springframework.core.task.AsyncTaskExecutor;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
-import javax.annotation.Resource;
 import java.time.LocalDateTime;
-import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
@@ -41,67 +42,60 @@ import static com.hmdp.utils.RedisConstants.*;
 @Component
 public class MultiLevelCacheService {
 
-    @Resource
-    private StringRedisTemplate stringRedisTemplate;
-
-    @Resource
-    private RedissonClient redissonClient;
-
-    @Resource
-    private Cache<String, Object> shopLocalCache;
-
-    /**
-     * 逻辑过期异步重建线程池：统一用容器里的 {@code traceAwareExecutor}
-     * （挂了 {@link com.hmdp.observability.MdcTaskDecorator}），
-     * 否则重建任务的日志与发起请求的那条链路是断的。
-     */
-    @Resource
-    @Qualifier(ObservabilityConfig.TRACE_AWARE_EXECUTOR)
-    private AsyncTaskExecutor rebuildExecutor;
-
-    @Resource
-    private CacheMetrics cacheMetrics;
-
-    /** 随机 TTL 因子，避免缓存雪崩 */
-    private static final Random RANDOM = new Random();
-
-    /**
-     * 缓存击穿互斥锁租期（秒）：DB 回源 + 写缓存的上界（不含 watchdog） */
+    /** 锁使用显式租期，避免线程异常后长期占用（禁用 watchdog）。 */
     private static final long MUTEX_LOCK_LEASE_SECONDS = 30;
-    /** 缓存重建锁租期（秒）：显式 lease 禁用 watchdog，重建线程挂死时锁自动释放 */
     private static final long REBUILD_LOCK_LEASE_SECONDS = 30;
-    /**
-     * 击穿互斥锁的有界等待时长（ms）：拿不到锁时轮询缓存等重建方写回的上限。
-     * 等待必须收敛——重建方卡住时，无界递归/无限等待会把请求线程全部占死，
-     * 和 Redis 800ms 命令超时是同一条收敛原则。
-     */
+    /** 有界等待重建方写回的上限与轮询间隔。 */
     private static final long MUTEX_WAIT_MILLIS = 1000;
+    private static final long MUTEX_POLL_INTERVAL_MILLIS = 50;
+    /** TTL 扰动及物理过期倍数，用于降低缓存雪崩和脏数据驻留风险。 */
+    private static final int NULL_TTL_JITTER_MINUTES = 3;
+    private static final double TTL_JITTER_RATIO = 0.2;
+    private static final long PHYSICAL_TTL_MULTIPLIER = 3;
+
+    private final StringRedisTemplate stringRedisTemplate;
+    private final RedissonClient redissonClient;
+    private final Cache<String, Object> shopLocalCache;
+    private final AsyncTaskExecutor rebuildExecutor;
+    private final CacheMetrics cacheMetrics;
+
+    /** 本 JVM 内先按 key 去重，Redisson 锁再负责多实例去重。 */
+    private final Set<String> rebuildingKeys = ConcurrentHashMap.newKeySet();
+
+    public MultiLevelCacheService(
+            StringRedisTemplate stringRedisTemplate,
+            RedissonClient redissonClient,
+            @Qualifier("shopLocalCache") Cache<String, Object> shopLocalCache,
+            @Qualifier(ObservabilityConfig.TRACE_AWARE_EXECUTOR) AsyncTaskExecutor rebuildExecutor,
+            CacheMetrics cacheMetrics) {
+        this.stringRedisTemplate = stringRedisTemplate;
+        this.redissonClient = redissonClient;
+        this.shopLocalCache = shopLocalCache;
+        this.rebuildExecutor = rebuildExecutor;
+        this.cacheMetrics = cacheMetrics;
+    }
 
     // ==================== 公开 API ====================
 
     /**
      * 多级缓存查询（穿透保护 + 逻辑过期防击穿）
      *
-     * <p>{@code @Retry(cacheQueryRetry)}：只读幂等路径才配重试（2 次、100ms 指数退避），
-     * 瞬时抖动自愈。放在这一层而不是 ShopServiceImpl 上是有意的——R4J 切面顺序
-     * Retry 在 CircuitBreaker 外层，如果把 Retry 和 fallback 放同一个方法，
-     * fallback 会把异常"消化"成正常返回，Retry 一次也触发不了；分层后顺序变成
-     * 熔断(外) → 重试(内) → 缓存查询，两次重试都失败才交给外层熔断 + 降级回源。
+     * <p>{@code @Retry(cacheQueryRetry)}：只读幂等路径才配重试（2 次、100ms 指数退避）。
+     * 放在这一层而不是 ShopServiceImpl 上是有意的——R4J 切面顺序 Retry 在 CircuitBreaker
+     * 外层，如果把 Retry 和 fallback 放同一个方法，fallback 会把异常"消化"成正常返回，
+     * Retry 一次也触发不了；分层后顺序变成 熔断(外) → 重试(内) → 缓存查询。
      * 写路径绝不加 Retry（领券重试可能重复扣库存）。
-     *
-     * @param keyPrefix Redis key 前缀
-     * @param id        业务 ID
-     * @param type      返回类型
-     * @param dbFallback 查库函数
-     * @param ttl       缓存时间
-     * @param unit      时间单位
      */
     @Retry(name = "cacheQueryRetry")
-    @SuppressWarnings("unchecked")
     public <R, ID> R queryWithMultiLevel(
-            String keyPrefix, ID id, Class<R> type,
-            Function<ID, R> dbFallback, Long ttl, TimeUnit unit) {
-        return queryWithMultiLevel(keyPrefix, id, type, dbFallback, ttl, unit, null, null);
+            String keyPrefix,
+            ID id,
+            Class<R> resultType,
+            Function<ID, R> dbFallback,
+            Long ttl,
+            TimeUnit unit) {
+        return queryWithMultiLevelVersioned(
+                keyPrefix, id, resultType, dbFallback, ttl, unit, null, null);
     }
 
     /**
@@ -116,48 +110,48 @@ public class MultiLevelCacheService {
      * 版本权威必须取自唯一不会消失的真相源（DB 的 update_time，
      * 由 ON UPDATE CURRENT_TIMESTAMP 自动维护，天然是行级版本号）。
      *
-     * <p>调用侧请走 6 参重载（带 {@code @Retry}）；本变体是它的实现载体。
+     * <p>该版本感知入口直接带 {@code @Retry}，调用侧必须经 Spring Bean 调用，
+     * 避免同类内部调用绕过 AOP 代理。
      *
      * @param snapshotVersionOf    从回查结果取版本（如 {@code Shop::getUpdateTime}），null = 关闭核验
      * @param currentVersionLoader 查 DB 当前行版本，null = 关闭核验
      */
-    @SuppressWarnings("unchecked")
-    public <R, ID> R queryWithMultiLevel(
-            String keyPrefix, ID id, Class<R> type,
-            Function<ID, R> dbFallback, Long ttl, TimeUnit unit,
+    @Retry(name = "cacheQueryRetry")
+    public <R, ID> R queryWithMultiLevelVersioned(
+            String keyPrefix,
+            ID id,
+            Class<R> resultType,
+            Function<ID, R> dbFallback,
+            Long ttl,
+            TimeUnit unit,
             Function<R, LocalDateTime> snapshotVersionOf,
             Function<ID, LocalDateTime> currentVersionLoader) {
 
-        String cacheKey = keyPrefix + id;
+        String cacheKey = buildCacheKey(keyPrefix, id);
 
-        // ── 第一层：Caffeine 本地缓存 ──
-        R local = (R) shopLocalCache.getIfPresent(cacheKey);
+        R local = getFromLocalCache(cacheKey);
         if (local != null) {
             cacheMetrics.hit(CacheMetrics.LEVEL_L1);
             log.debug("[多级缓存] L1 Caffeine 命中: {}", cacheKey);
             return local;
         }
 
-        // ── 第二层：Redis ──
         String json = stringRedisTemplate.opsForValue().get(cacheKey);
         if (StrUtil.isNotBlank(json)) {
-            // 检查逻辑过期
             RedisData redisData = JSONUtil.toBean(json, RedisData.class);
-            R data = JSONUtil.toBean((cn.hutool.json.JSONObject) redisData.getData(), type);
+            R data = deserializeCachedValue(redisData, resultType);
             LocalDateTime expireTime = redisData.getExpireTime();
 
             cacheMetrics.hit(CacheMetrics.LEVEL_L2);
             if (expireTime.isAfter(LocalDateTime.now())) {
-                // 未过期 → 写回 Caffeine，返回
                 shopLocalCache.put(cacheKey, data);
                 log.debug("[多级缓存] L2 Redis 命中: {}", cacheKey);
                 return data;
             }
-
-            // 逻辑过期 → 异步重建（返回旧数据不阻塞请求）
+            // 逻辑过期 → 异步重建（返回旧数据不阻塞请求）。旧值只服务当前请求，不进入普通
+            // 30s L1；否则 Redis 已重建后仍会被 L1 挡住，删除场景下还可能发生
+            // "重建线程清 L1、请求线程随后写回幽灵旧值" 的竞态。
             rebuildAsync(keyPrefix, id, dbFallback, ttl, unit, snapshotVersionOf, currentVersionLoader);
-            // 返回旧数据
-            shopLocalCache.put(cacheKey, data);
             return data;
         }
 
@@ -168,9 +162,8 @@ public class MultiLevelCacheService {
             return null;
         }
 
-        // ── 第三层：查 MySQL（互斥锁防击穿）──
         cacheMetrics.hit(CacheMetrics.LEVEL_DB);
-        R result = queryWithMutexLock(keyPrefix, id, type, dbFallback, ttl, unit,
+        R result = queryWithMutexLock(keyPrefix, id, resultType, dbFallback, ttl, unit,
                 snapshotVersionOf, currentVersionLoader);
         if (result != null) {
             shopLocalCache.put(cacheKey, result);
@@ -178,11 +171,8 @@ public class MultiLevelCacheService {
         return result;
     }
 
-    /**
-     * 删除所有级别的缓存（写操作时调用）
-     */
     public void evict(String keyPrefix, Object id) {
-        String key = keyPrefix + id;
+        String key = buildCacheKey(keyPrefix, id);
         shopLocalCache.invalidate(key);
         stringRedisTemplate.delete(key);
         log.debug("[多级缓存] 已清除: {}", key);
@@ -203,12 +193,12 @@ public class MultiLevelCacheService {
             Function<R, LocalDateTime> snapshotVersionOf,
             Function<ID, LocalDateTime> currentVersionLoader) {
 
-        String key = keyPrefix + id;
+        String key = buildCacheKey(keyPrefix, id);
         RLock lock = redissonClient.getLock(LOCK_SHOP_KEY + id);
 
         boolean locked = false;
         try {
-            // 显式 wait/lease：wait=0（拿不到走下面的有界轮询）、lease=30s 硬上限（不含 watchdog）
+            // wait=0（拿不到走下面的有界轮询）、lease=30s 硬上限（不含 watchdog）
             locked = lock.tryLock(0, MUTEX_LOCK_LEASE_SECONDS, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -221,7 +211,7 @@ public class MultiLevelCacheService {
                 String json = stringRedisTemplate.opsForValue().get(key);
                 if (StrUtil.isNotBlank(json)) {
                     cacheMetrics.hit(CacheMetrics.LEVEL_L2);
-                    return fromLogicalExpireJson(json, type);
+                    return deserializeCachedValue(json, type);
                 }
                 return loadAndCache(key, id, dbFallback, ttl, unit,
                         snapshotVersionOf, currentVersionLoader);
@@ -233,24 +223,24 @@ public class MultiLevelCacheService {
             }
         }
 
-        // ── 拿不到锁：有界轮询等待重建方写回 ──
+        // 拿不到锁：有界轮询等待重建方写回
         long deadline = System.currentTimeMillis() + MUTEX_WAIT_MILLIS;
         while (System.currentTimeMillis() < deadline) {
             try {
                 String json = stringRedisTemplate.opsForValue().get(key);
                 if (StrUtil.isNotBlank(json)) {
                     cacheMetrics.hit(CacheMetrics.LEVEL_L2);
-                    return fromLogicalExpireJson(json, type);
+                    return deserializeCachedValue(json, type);
                 }
                 if (json != null) {
                     cacheMetrics.hit(CacheMetrics.LEVEL_L2); // 空值标记同样是 L2 响应
-                    return null; // 空值防穿透标记：数据真不存在，不必再等
+                    return null; // 数据真不存在，不必再等
                 }
             } catch (Exception e) {
                 break; // Redis 不可用：跳出等待交给上层熔断/降级，不在循环里空转
             }
             try {
-                Thread.sleep(50);
+                Thread.sleep(MUTEX_POLL_INTERVAL_MILLIS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
@@ -261,11 +251,21 @@ public class MultiLevelCacheService {
         return dbFallback.apply(id);
     }
 
-    /** 解析逻辑过期格式的缓存 JSON */
+    private static String buildCacheKey(String keyPrefix, Object id) {
+        return keyPrefix + id;
+    }
+
     @SuppressWarnings("unchecked")
-    private <R> R fromLogicalExpireJson(String json, Class<R> type) {
-        RedisData redisData = JSONUtil.toBean(json, RedisData.class);
-        return JSONUtil.toBean((cn.hutool.json.JSONObject) redisData.getData(), type);
+    private <R> R getFromLocalCache(String key) {
+        return (R) shopLocalCache.getIfPresent(key);
+    }
+
+    private <R> R deserializeCachedValue(String json, Class<R> resultType) {
+        return deserializeCachedValue(JSONUtil.toBean(json, RedisData.class), resultType);
+    }
+
+    private <R> R deserializeCachedValue(RedisData redisData, Class<R> resultType) {
+        return JSONUtil.toBean((cn.hutool.json.JSONObject) redisData.getData(), resultType);
     }
 
     /**
@@ -279,8 +279,8 @@ public class MultiLevelCacheService {
             Function<ID, LocalDateTime> currentVersionLoader) {
         R result = dbFallback.apply(id);
         if (result == null) {
-            // 空值缓存防穿透，加随机 TTL
-            long randomTtl = CACHE_NULL_TTL + RANDOM.nextInt(3);
+            long randomTtl = CACHE_NULL_TTL
+                    + ThreadLocalRandom.current().nextInt(NULL_TTL_JITTER_MINUTES);
             stringRedisTemplate.opsForValue().set(key, "", randomTtl, TimeUnit.MINUTES);
             return null;
         }
@@ -289,58 +289,60 @@ public class MultiLevelCacheService {
         if (isStaleSnapshot(id, result, snapshotVersionOf, currentVersionLoader)) {
             return result;
         }
-        // 写入 Redis（逻辑过期模式）
         writeWithLogicalExpire(key, result, ttl, unit);
         return result;
     }
 
-    /**
-     * 异步重建过期缓存
-     */
     private <R, ID> void rebuildAsync(
             String keyPrefix, ID id, Function<ID, R> dbFallback, Long ttl, TimeUnit unit,
             Function<R, LocalDateTime> snapshotVersionOf,
             Function<ID, LocalDateTime> currentVersionLoader) {
 
+        String cacheKey = buildCacheKey(keyPrefix, id);
+        if (!rebuildingKeys.add(cacheKey)) {
+            return;
+        }
         RLock lock = redissonClient.getLock(LOCK_SHOP_KEY + id);
-        rebuildExecutor.submit(() -> {
-            // 在重建线程内加锁，保证锁的持有与释放为同一线程；
-            // 显式 lease=30s 禁用 watchdog，重建线程挂死时锁最迟 30s 自动释放
-            boolean locked;
-            try {
-                locked = lock.tryLock(0, REBUILD_LOCK_LEASE_SECONDS, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return; // 已经有别的线程在重建
-            }
-            if (!locked) {
-                return; // 已经有别的线程在重建
-            }
-            try {
-                R data = dbFallback.apply(id);
-                if (data == null) {
-                    // DB 已无此行（物理删除）：主动删掉旧缓存，让后续请求走 miss → 互斥锁 → 空值标记。
-                    // 旧实现只跳过写回不删 key——被删商铺的旧值会一直循环触发重建（查到 null → 不动），
-                    // 驻留到物理 TTL 保险丝（3 倍逻辑 TTL）耗尽才消失。
-                    // 顺序：先删长命的 L2 再清 L1——中途崩溃时 L1 幽灵最多活 30s（自身 TTL 自愈），方向安全。
-                    // delete 与并发 evict 是幂等交叠（删一个已被 evict 删掉的 key 是 no-op），无新竞态
-                    stringRedisTemplate.delete(keyPrefix + id);
-                    shopLocalCache.invalidate(keyPrefix + id);
-                } else if (!isStaleSnapshot(id, data, snapshotVersionOf, currentVersionLoader)) {
-                    writeWithLogicalExpire(keyPrefix + id, data, ttl, unit);
+        try {
+            rebuildExecutor.submit(() -> {
+                try {
+                    // 在重建线程内加锁，保证锁的持有与释放为同一线程；
+                    // 显式 lease=30s 禁用 watchdog，重建线程挂死时锁最迟 30s 自动释放
+                    boolean locked;
+                    try {
+                        locked = lock.tryLock(0, REBUILD_LOCK_LEASE_SECONDS, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    if (!locked) {
+                        return; // 其他实例正在重建
+                    }
+                    try {
+                        R data = dbFallback.apply(id);
+                        if (data == null) {
+                            stringRedisTemplate.delete(cacheKey);
+                            shopLocalCache.invalidate(cacheKey);
+                        } else if (!isStaleSnapshot(id, data, snapshotVersionOf, currentVersionLoader)) {
+                            writeWithLogicalExpire(cacheKey, data, ttl, unit);
+                        }
+                        cacheMetrics.rebuilt(true);
+                    } catch (Exception e) {
+                        cacheMetrics.rebuilt(false);
+                        log.error("[多级缓存] 异步重建失败: {}", cacheKey, e);
+                    } finally {
+                        if (lock.isHeldByCurrentThread()) {
+                            lock.unlock();
+                        }
+                    }
+                } finally {
+                    rebuildingKeys.remove(cacheKey);
                 }
-                cacheMetrics.rebuilt(true);
-            } catch (Exception e) {
-                // 重建失败原本只会被线程池吞掉，落指标后才能配告警发现「缓存长期不刷新」
-                cacheMetrics.rebuilt(false);
-                log.error("[多级缓存] 异步重建失败: {}", keyPrefix + id, e);
-            } finally {
-                // 租期内未完成时锁已自动过期，此处再 unlock 会抛 IllegalMonitorStateException
-                if (lock.isHeldByCurrentThread()) {
-                    lock.unlock();
-                }
-            }
-        });
+            });
+        } catch (RuntimeException e) {
+            rebuildingKeys.remove(cacheKey);
+            throw e;
+        }
     }
 
     /**
@@ -377,20 +379,18 @@ public class MultiLevelCacheService {
         return stale;
     }
 
-    /**
-     * 写入 Redis，带逻辑过期时间戳
-     */
     private void writeWithLogicalExpire(String key, Object value, Long ttl, TimeUnit unit) {
         RedisData redisData = new RedisData();
         redisData.setData(value);
         // 随机 TTL ± 20%，避免同时过期引发雪崩
         long baseSec = unit.toSeconds(ttl);
-        long jitter = (long) (baseSec * 0.2 * RANDOM.nextDouble());
+        long jitter = (long) (baseSec * TTL_JITTER_RATIO
+                * ThreadLocalRandom.current().nextDouble());
         redisData.setExpireTime(LocalDateTime.now().plusSeconds(baseSec + jitter));
         // 物理 TTL 保险丝：不参与正常过期判断（那是 expireTime 的职责）。逻辑过期把过期判断
         // 挪进了应用层，Redis 侧这个 key 本身永不过期；一旦主动删除与异步重建同时失败，
         // 脏数据将无限期驻留。这里保证最迟 3 倍逻辑 TTL 内自愈，把 ∞ 变成有限值。
         stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(redisData),
-                baseSec * 3, TimeUnit.SECONDS);
+                baseSec * PHYSICAL_TTL_MULTIPLIER, TimeUnit.SECONDS);
     }
 }

@@ -16,14 +16,9 @@ import java.nio.charset.StandardCharsets;
 /**
  * 业务层滑动窗口限流：领券相关接口按 userId 限流（需在登录拦截器之后）。
  *
- * <p><b>两类请求各算各的配额，互不占用：</b>
- * <table>
- *   <tr><td>POST /voucher-order/seckill/{id}</td><td>领券</td><td>严格（5 次/秒）</td></tr>
- *   <tr><td>GET /voucher-order/seckill/result/{id}</td><td>查落库</td><td>宽松但要封顶</td></tr>
- * </table>
- *
- * <p>为什么要拆开：共用一个 key 的话，前端为了拿到结果多查几次，就把自己的
- * 领券额度烧光了——真正想领券时反而被 429。两者性质不同，配额也该不同。
+ * <p><b>两类请求各算各的配额，互不占用：</b>领券严格（5 次/秒），查落库宽松但封顶。
+ * 共用一个 key 的话，前端为了拿到结果多查几次就把自己的领券额度烧光了——
+ * 真正想领券时反而被 429。两者性质不同，配额也该不同。
  *
  * <p><b>限流的真正目的是防穿透，不是防轮询洪峰。</b>
  * 轮询规模被库存数封顶：只有领券成功（或降级拿到 orderId）的人才查得了，
@@ -35,7 +30,6 @@ import java.nio.charset.StandardCharsets;
 @Component
 public class SlidingWindowInterceptor implements HandlerInterceptor {
 
-    /** 结果查询（落库）的 URI 片段 */
     private static final String URI_SECKILL_RESULT = "/seckill/result/";
 
     @Resource
@@ -44,14 +38,12 @@ public class SlidingWindowInterceptor implements HandlerInterceptor {
     @Value("${seckill.rate-limit.sliding-window.enabled:true}")
     private boolean enabled;
 
-    // ---- 领券动作：严格 ----
     @Value("${seckill.rate-limit.sliding-window.window-ms:1000}")
     private long windowMs;
 
     @Value("${seckill.rate-limit.sliding-window.max-requests:5}")
     private int maxRequests;
 
-    // ---- 结果查询（落库）：宽松但要封顶 ----
     @Value("${seckill.rate-limit.sliding-window.result-window-ms:1000}")
     private long resultWindowMs;
 
@@ -82,8 +74,8 @@ public class SlidingWindowInterceptor implements HandlerInterceptor {
         String key;
         int max;
         long window;
-        // 只有「领券」这一个动作计入秒杀请求数。结果查询是领券派生出来的后续轮询，
-        // 算进分母会让「被限流比例」失真（看起来限流很轻）。
+        // 结果查询是领券派生出来的后续轮询，算进分母会让「被限流比例」失真（看起来限流很轻），
+        // 所以只有「领券」这一个动作计入秒杀请求数。
         // 默认分支按领券处理：将来若挂了新 path 忘了配规则，至少还有严格限流兜着。
         boolean isSeckillSubmit = !uri.contains(URI_SECKILL_RESULT);
 
@@ -103,7 +95,7 @@ public class SlidingWindowInterceptor implements HandlerInterceptor {
             allowed = slidingWindowRateLimiter.tryAcquire(key, window, max);
         } catch (Exception e) {
             // 限流器 fail-open：限流是保护手段而不是业务依赖，它自己故障不能把主链路一起拖死。
-            // 但必须计数 —— 这个指标就是「系统正在裸奔」的告警信号。
+            // 但必须计数——这个指标就是「系统正在裸奔」的告警信号。
             // （业务层仍是 fail-closed：库存不足、重复领取一律拒绝）
             log.error("滑动窗口限流异常，fail-open 放行, userId={}, uri={}", userId, uri, e);
             seckillMetrics.rateLimitFallback("fail_open");

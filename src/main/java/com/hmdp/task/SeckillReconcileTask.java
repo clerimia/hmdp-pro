@@ -133,9 +133,8 @@ public class SeckillReconcileTask {
                 });
                 reconcileMetrics.round(ReconcileMetrics.OUTCOME_COMPLETED);
             } else {
-                // 补过单（SUPPLEMENTED）或异常（null）都跳过重算：补单结果不确定就跳过——
-                // 补单半途中断时 COUNT 比真实账本少几笔，expected 会算大、凭空多放库存。
-                // 晚算没有代价，算错才有。
+                // 补单结果不确定就跳过重算：补单半途中断时 COUNT 比真实账本少几笔，
+                // expected 会算大、凭空多放库存。晚算没有代价，算错才有。
                 log.warn("对账：本轮补单结果不确定（{}），跳过库存重算，下轮再算",
                         supplemented == StepResult.SUPPLEMENTED ? "发生过补单" : "步骤异常");
                 reconcileMetrics.round(ReconcileMetrics.OUTCOME_SKIPPED_SUPPLEMENT);

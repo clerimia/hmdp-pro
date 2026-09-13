@@ -9,13 +9,9 @@ import java.time.format.DateTimeFormatter;
 
 @Component
 public class RedisIdWorker {
-    /**
-     * 开始时间戳
-     */
+    /** 纪元起点：2022-01-01 00:00:00 UTC */
     private static final long BEGIN_TIMESTAMP = 1640995200L;
-    /**
-     * 序列号的位数
-     */
+    /** 自增序列占用的低位位数 */
     private static final int COUNT_BITS = 32;
 
     private StringRedisTemplate stringRedisTemplate;
@@ -25,18 +21,14 @@ public class RedisIdWorker {
     }
 
     public long nextId(String keyPrefix) {
-        // 1.生成时间戳
         LocalDateTime now = LocalDateTime.now();
         long nowSecond = now.toEpochSecond(ZoneOffset.UTC);
         long timestamp = nowSecond - BEGIN_TIMESTAMP;
 
-        // 2.生成序列号
-        // 2.1.获取当前日期，精确到天
+        // 序列号按天分桶：key 带 yyyy:MM:dd，天然避免单调递增导致位溢出
         String date = now.format(DateTimeFormatter.ofPattern("yyyy:MM:dd"));
-        // 2.2.自增长
         long count = stringRedisTemplate.opsForValue().increment("icr:" + keyPrefix + ":" + date);
 
-        // 3.拼接并返回
         return timestamp << COUNT_BITS | count;
     }
 }

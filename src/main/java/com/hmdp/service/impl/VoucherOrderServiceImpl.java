@@ -46,10 +46,6 @@ import java.util.concurrent.TimeUnit;
 import static com.hmdp.utils.RedisConstants.*;
 
 /**
- * <p>
- * 服务实现类
- * </p>
- *
  * <p><b>领券只有一条写路径</b>（原方案 B 已删除，理由见 {@link SeckillMode}）：
  * 入口 Lua 原子预扣 Redis 库存 + 一人一单 → 事务消息 → 消费者落库。
  *
@@ -166,14 +162,14 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      *
      * <p><b>幂等键是订单主键 orderId，不是 (userId, voucherId)。</b>
      * 消息重投时消息体是同一个 {@code VoucherOrder}（含 id），撞的是主键；
-     * 而一人一单在入口 Lua 的 {@code sismember} 就已经拦掉了，消费者根本收不到
-     * 「一人多单」的消息。因此落库顺序必须是<b>先 insert 再扣库存</b>——重投的消息
-     * 在 insert 就被主键拦下、事务回滚，库存压根不会被扣；反过来先扣库存的话，
-     * 重投会先扣一次再回补，白白多两次写和一段中间态。
+     * 而一人一单在入口 Lua 的 {@code sismember} 就已经拦掉了。因此落库顺序必须是
+     * <b>先 insert 再扣库存</b>——重投的消息在 insert 就被主键拦下、事务回滚，
+     * 库存压根不会被扣；反过来先扣库存的话，重投会先扣一次再回补，白白多两次写
+     * 和一段中间态。
      *
      * <p><b>已去掉原来的 Redisson 锁 + count 预查。</b>
      * 它们保护的是「一人一单」，而该约束已由入口 Lua 保证，消费端的锁纯属重复串行化：
-     * 每单多 2 次 Redis 往返（加锁/解锁）+ 1 次 SELECT，且同一用户的订单全部排队，
+     * 每单多 2 次 Redis 往返 + 1 次 SELECT，且同一用户的订单全部排队，
      * {@code tryLock(2s)} 在挤压时会迅速占满业务线程池。{@code LEGACY} 档位可切回对照。
      *
      * <p>P2 容错：{@code dbBreaker}（50%/窗口 20/半开 15s）包裹整个落库流程。
@@ -241,9 +237,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             } catch (DuplicateKeyException e) {
                 // 同一 orderId 重投（或 EARLY 档下撞 uk_user_voucher）：事务已回滚、
                 // DB 库存未扣，零副作用，不需要回补。
-                // 注意 EARLY 档的语义差异：入口扣了两次 Redis 却只落一单，会多扣一次
-                // Redis 库存——该档位本就是「故意不用 Redis 去重」的对照组，
-                // 不额外补偿，由活动结束后的对账重算收敛。
+                // EARLY 档的语义差异：入口扣了两次 Redis 却只落一单，会多扣一次 Redis
+                // 库存——该档位本就是「故意不用 Redis 去重」的对照组，不额外补偿，
+                // 由活动结束后的对账重算收敛。
                 log.info("重复订单消息，唯一约束拦截, orderId={}, userId={}, voucherId={}",
                         orderId, userId, voucherId);
                 writeQueueStatusSafe(orderId, SeckillMode.QUEUE_SUCCESS);
@@ -269,9 +265,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
     }
 
-    /**
-     * 事务消息本地事务：Lua 库存 + 一人一单 + 写 seckill:txn 标记
-     */
+    /** 事务消息本地事务：Lua 库存 + 一人一单 + 写 seckill:txn 标记 */
     @Override
     public long executeSeckillLocalTransaction(Long voucherId, Long userId, Long orderId) {
         String protection = oneOrderProtection();
@@ -312,10 +306,10 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         ObservabilityRecorder.Sample sample = seckillMetrics.startSeckill();
         SeckillMetrics.Reason reason = SeckillMetrics.Reason.SUCCESS;
         try {
-            // ⓪ 活动窗口校验：预热 meta（同时顺带补库存），再判断未开始 / 已结束。
-            //    这一步此前完全缺失——活动没开抢能抢、结束了还能抢。
-            //    校验放在 Lua 之前而不是塞进 Lua，是为了让 A/B 之外的降级路径
-            //    （熔断打开）也能被挡住，且失败原因能被 reason 指标区分。
+            // 活动窗口校验：预热 meta（同时顺带补库存），再判断未开始 / 已结束。
+            // 这一步此前完全缺失——活动没开抢能抢、结束了还能抢。
+            // 校验放在 Lua 之前而不是塞进 Lua，是为了让 A/B 之外的降级路径
+            // （熔断打开）也能被挡住，且失败原因能被 reason 指标区分。
             SeckillWindow window = seckillWarmUpService.ensureWarmed(voucherId);
             if (window == null) {
                 reason = SeckillMetrics.Reason.VOUCHER_NOT_SECKILL;
@@ -409,7 +403,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      * <p><b>为什么第 ① 步不校验归属：</b>排队状态的 value 只有 WAITING/SUCCESS/FAIL_* 这几个
      * 状态字，没有任何敏感信息；而一旦校验归属就得先查 DB，这一步「不打 DB」的意义就没了。
      * 真正让 orderId 不可枚举的是它本身——UidGenerator 出来的 63 位雪花 ID 带时间戳
-     * （28 bit）+ workerId（22 bit）+ 序列号（13 bit），攻击者猜不出一段有效区间。
+     * + workerId + 序列号，攻击者猜不出一段有效区间。
      * 这是个明确的取舍：用「不可枚举」换「不查 DB」，收益是降级窗口里 DB 不被轮询压垮。
      *
      * <p><b>为什么第 ② 步必须校验归属：</b>订单表里有 userId、createTime 等敏感字段，

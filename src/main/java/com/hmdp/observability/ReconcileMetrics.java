@@ -41,9 +41,7 @@ public class ReconcileMetrics {
     public static final String OUTCOME_SKIPPED_SUPPLEMENT = "skipped_supplement";
     /** round 的 outcome：分布式锁抢锁失败，本轮没有执行 */
     public static final String OUTCOME_SKIPPED_LOCK = "skipped_lock";
-    /** step 的取值：补单 */
     public static final String STEP_SUPPLEMENT = "supplement";
-    /** step 的取值：库存重算 */
     public static final String STEP_RESTOCK = "restock";
 
     private final ObservabilityRecorder recorder;
@@ -52,12 +50,12 @@ public class ReconcileMetrics {
         this.recorder = recorder;
     }
 
-    /** 一轮对账的结局：completed（两步都执行）/ skipped_supplement（补过单或补单异常，跳过重算）/ skipped_lock（抢锁失败） */
+    /** 一轮对账的结局，取值见 OUTCOME_* 常量 */
     public void round(String outcome) {
         recorder.increment(RECONCILE_ROUND, "outcome", outcome);
     }
 
-    /** 步骤级成败：step 取 supplement / restock，ok=false 即 result=error（runStep 吞掉的异常） */
+    /** 步骤级成败：ok=false 即 result=error（runStep 吞掉的异常的唯一外部出口） */
     public void step(String step, boolean ok) {
         recorder.increment(RECONCILE_STEP, "step", step, "result", ok ? "ok" : "error");
     }
