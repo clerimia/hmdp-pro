@@ -126,17 +126,14 @@ broker 重启（tmpfs，消息全丢）导致券 13 有 **2 笔已预扣但消�
 ## 4. 环境备忘（本轮更新）
 
 - **`docker compose`（空格）本机不可用**，必须 **`docker-compose`（横线，v2.35.1-desktop.1）**；引擎 Docker 28.1.1
-- **`rocketmq-broker` 的 store 只能用 tmpfs，挂载卷一律退出 253**。本轮在两个新前提下各验证一次，都失败，**别再试了**：
-  - 假设 A「是 JDK 8u372 cgroup v2 bug」→ 加了 `-XX:-UseContainerSupport` 后命名卷**仍旧 253**，而 tmpfs 正常 ⇒ 两者是独立问题
-  - 假设 B「是卷属主权限」→ 镜像里根本没有 `/home/rocketmq/store`，挂空卷后由 root 创建；`chown 3000:3000` 后**仍旧 253**
-  - 剩余最可能原因：RocketMQ 对 commitlog 的 mmap 在 Docker Desktop 的挂载卷后端上不被支持
-- **tmpfs 的代价（重要）**：broker 重启后 topic 元数据全丢，topic 要等**首次发送**才被 `autoCreateTopicEnable` 自动创建 → 消费者启动时 topic 不存在 → **重启后前几单消费不到**（本轮实测：领券后等了约 60s 客户端刷新路由才追平）。broker 重启后记得重启应用。
+- **2026-09-06 更正：Broker store 已改为 Docker named volume**。旧的 253 并非 mmap 不支持，实际日志是 `store/lock (Permission denied)`。Compose 以 root 进入后先 `chown`，再用 `runuser` 降权为 uid 3000 启动 Broker。已实测「创建 topic → 重启 Broker → topic 仍存在」。
+- Broker 重启不再丢 topic/位点/消息，也不再需要因 store 清空而重启应用。
 - **broker 重启后必须手动预建 topic**：事务消息发往 `RMQ_SYS_TRANS_HALF_TOPIC`，**不会触发 autoCreate**，所以重启应用也救不回来，会一直报 `No route info of this topic`。必须：
   ```bash
   docker exec hmdp-pro-rocketmq-broker-1 sh -c \
     "/home/rocketmq/rocketmq-4.9.7/bin/mqadmin updateTopic -n rocketmq-namesrv:9876 -b broker-a -t order-seckill-topic"
   ```
-- **broker 秒退 253 且 `docker logs` 只显示 `boot success` 时**：真凶是 tmpfs 属主为 root、rocketmq 用户（uid 3000）写不进 `/home/rocketmq/store/lock`。compose 里已用 `tmpfs: - /home/rocketmq/store:uid=3000,gid=3000` 固定。异常只在容器内 `broker.log` 里，用 `docker cp` 取出来看。
+- **broker 秒退 253 且 `docker logs` 只显示 `boot success` 时**：先查容器内 `broker.log`。本项目的真凶是 named volume 初始属主为 root，uid 3000 写不进 `/home/rocketmq/store/lock`；Compose 已在降权启动前修正属主。
 - MySQL：宿主机 **3307**，root/123456，容器 TZ=Asia/Shanghai
 - Git Bash 下用 **`mvn.cmd`**；改了 `db/` 下 SQL 必须 `docker-compose down -v` 才会重跑
 - `application-local.yaml` 已 gitignored；git push 间歇性连不上 github，**直接重试**即可

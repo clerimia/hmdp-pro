@@ -7,8 +7,8 @@
 
 ```
 POST /user/code ──→ Redis login:code:{phone}（TTL 2 分钟，6 位纯数字）
-POST /user/login ──→ 校验码（equals 比对，不删码）──→ 用户不存在则自动注册
-                ──→ 生成 UUID token ──→ Redis login:token:{token}（hash，TTL 36000 分钟 = 25 天）
+POST /user/login ──→ Lua 原子校验并消费验证码 ──→ 用户不存在则自动注册
+                ──→ 生成 UUID token ──→ Redis login:token:{token}（hash，TTL 30 分钟）
 每个请求 ──→ RefreshTokenInterceptor（挂 /**，命中即滑动续期）──→ LoginInterceptor（无用户 → 401）
 ```
 
@@ -19,11 +19,11 @@ POST /user/login ──→ 校验码（equals 比对，不删码）──→ 用
 | # | 事实 | 出处 |
 |---|------|------|
 | F1 | 验证码 TTL = 2 分钟，6 位纯数字 | `RedisConstants.LOGIN_CODE_TTL`、`UserServiceImpl:56` |
-| F2 | 发码无任何频控，每次覆盖旧码 | `UserServiceImpl.sendCode` |
-| F3 | 验证码不是一次性的：登录成功后不删码 | `UserServiceImpl:76-81` |
-| F4 | login 无限流（滑动窗口只挂 `/voucher-order/seckill` 两 path） | `MvcConfig:41-44` |
-| F5 | token TTL = 36000 分钟 = 25 天；RefreshTokenInterceptor 挂 `/**`，任意请求滑动续期 → 登录态实际永不过期 | `RedisConstants.LOGIN_USER_TTL`、`RefreshTokenInterceptor:51` |
-| F6 | logout 是 TODO，返回 `功能未完成` | `UserController:60-64` |
+| F2 | 首次发码写入 60 秒冷却 Key；冷却期内重复请求幂等成功且不覆盖当前验证码 | `UserServiceImpl.sendCode` |
+| F3 | 验证码由 Lua 原子比较并删除，只能成功使用一次 | `verify_login_code.lua` |
+| F4 | 同号连续错码 5 次后锁定 5 分钟 | `verify_login_code.lua` |
+| F5 | token TTL = 30 分钟；RefreshTokenInterceptor 对活跃会话滑动续期 | `RedisConstants.LOGIN_USER_TTL`、`RefreshTokenInterceptor` |
+| F6 | logout 幂等删除当前 token，旧 token 随即失效 | `UserController`、`UserServiceImpl` |
 | F7 | 手机号正则严卡 11 位大陆号段，拒 `+86` | `RegexPatterns.PHONE_REGEX` |
 | F8 | 任意合法手机号自动注册 → 无预置用户也能测全链路 | `UserServiceImpl:87-90` |
 | F9 | Redis 挂时 RefreshTokenInterceptor fail-open 放行 → LoginInterceptor 401，不会 500 | `RefreshTokenInterceptor:35-41` |
@@ -34,8 +34,8 @@ POST /user/login ──→ 校验码（equals 比对，不删码）──→ 用
 | 层 | 内容 | 处置 |
 |----|------|------|
 | **A. 既有语义的正向验证** | 缺/伪造/失效 token → 401；Redis 挂 → 401 不 500（fail-open 是已拍板设计，用例验证设计正确） | 进 pytest |
-| **B. 已存在缺陷的证据用例** | 同码二次登录（F3）、发码无频控（F2）、连错无锁定（F4+F1：6 位数字码在线暴破可行） | 进 pytest——**测试职责是证明缺陷存在，不是修复它** |
-| **C. 需产品决策的防护改造** | 发码限流、错码锁定、TTL 25 天收敛、logout 实现、并发多 token | **不进本 map**（写代码不在范围），记入 §7「发现与风险」 |
+| **B. 安全缺陷闭环** | 同码复用、发码无频控、错码无锁定、长会话和 logout 缺失 | 先由 pytest 稳定复现，再修复并回归 |
+| **C. 已落地防护** | 发码幂等冷却、错码锁定、一次性验证码、30 分钟滑动会话、幂等 logout | 23 条登录套件持续验证 |
 
 新增判据：**测缺陷 ≠ 测修复**——防护尚未实现，就不存在「验证修复」的用例。
 三判据（确定性 / 零 sleep / 可重复）与两级缓存票完全套用。
@@ -52,8 +52,8 @@ POST /user/login ──→ 校验码（equals 比对，不删码）──→ 用
 | TC-S02 | 无 | phone=空串 / 纯字母 | fail「手机号格式错误」 | P1 | pytest |
 | TC-S03 | 无 | phone=10 位 / 12 位数字 | fail（长度边界贴 11 切） | P1 | pytest |
 | TC-S04 | 无 | phone=`+86` 前缀合法号 | fail（F7，国际区号被拒） | P1 | pytest |
-| TC-S05 | fixture 发码 | 连发两个码：旧码登录 + 新码登录 | 旧码 fail；新码 200（F2 覆盖语义） | **P0** | pytest |
-| TC-S06 | 无 | 同一 phone 连发 10 次 | 全部 200 → 证明发码无频控（B 层） | P1 | pytest |
+| TC-S05 | fixture 发码 | 60 秒内再次请求发码 | 幂等成功、Redis 中验证码不变，当前码仍可登录 | **P0** | pytest |
+| TC-S06 | fixture 发码 | 60 秒内连续请求 4 次 | 全部幂等成功、验证码始终不变、冷却 Key TTL ≤ 60 秒 | P1 | pytest |
 
 ### 登录侧（POST /user/login）
 
@@ -68,8 +68,8 @@ POST /user/login ──→ 校验码（equals 比对，不删码）──→ 用
 | TC-L07 | fixture + 注入 | 取码后 `EXPIRE login:code:{phone} 1`，等过期 | fail（秒级注入，不标 slow） | P1 | pytest |
 | TC-L09 | fixture | 合法号 + 正确码登录 | 返回 token；Redis 有 `login:token:{token}` hash；`GET /user/me` 返回该用户 | **P0** | pytest |
 | TC-L10 | 未注册号 fixture | 用新号登录 | 200 + 直连 MySQL 断言 `tb_user` 新增一行（F8） | **P0** | pytest |
-| TC-L11 | fixture，登录成功 1 次 | 同码第二次登录 | **成功** → 证明验证码非一次性（B 层缺陷证据，F3） | P1 | pytest |
-| TC-L12 | TC-L09 的 token | 记录 TTL → 任意请求一次 → 再查 TTL | `TTL(login:token:{token})` 回满值（≈36000 分钟，容忍误差） | P1 | pytest |
+| TC-L11 | fixture，登录成功 1 次 | 同码第二次登录 | 失败，证明验证码已被原子消费 | P1 | pytest |
+| TC-L12 | TC-L09 的 token | 把 TTL 注入为 60 秒 → 请求一次 → 再查 TTL | TTL 回满至约 1800 秒 | P1 | pytest |
 
 ### 会话与拦截器层
 
@@ -79,7 +79,7 @@ POST /user/login ──→ 校验码（equals 比对，不删码）──→ 用
 | TC-L14 | 无 | 伪造合法格式 token（Redis 无 key） | 401，非 500 | **P0** | pytest |
 | TC-L15 | TC-L09 的 token | 直连 `DEL login:token:{token}` 后访问 | 401（状态注入代替 logout，F6） | P1 | pytest |
 | TC-L16 | TC-L09 的 token | `authorization: Bearer {token}`（带前缀） | 401（拦截器不剥 Bearer，前端约定裸 token） | P1 | pytest |
-| TC-L17 | fixture | 同一 phone 连试 5 次错码 | 5 次全 fail 放行、无锁定无计数 → 证明无暴破防护（B 层） | P1 | pytest |
+| TC-L17 | fixture | 同一 phone 连试 5 次错码，再提交正确码 | 正确码仍被拒绝，锁定 5 分钟 | P1 | pytest |
 | TC-L18 | DEBUG SLEEP 注入 Redis 故障 | 带 token 请求受保护接口 | 401 不 500（F9 fail-open 链路） | P1 | pytest，**slow**（约 30s） |
 
 > TC-L08 与 TC-S05 是同一场景的两侧断言，合并为一条用例，不单独编号。
@@ -98,9 +98,9 @@ POST /user/login ──→ 校验码（equals 比对，不删码）──→ 用
 
 | 不测项 | 理由 |
 |--------|------|
-| token 自然过期 | F5：TTL 25 天 + 任意请求滑动续期，等不起；路径与「DEL 注入」重合，由 TC-L15 替代 |
-| 真跑 10⁶ 次验证码暴破 | TC-L17 已证明无防护，结论等价 |
-| logout 接口本身 | F6：TODO 未实现；实现后补 2 条（登出后旧 token 401、重复登出幂等），见 §7 |
+| token 自然过期 | TTL 30 分钟仍不适合测试等待；把 TTL 注入为 60 秒验证续期，DEL 注入验证失效 |
+| 真跑 10⁶ 次验证码暴破 | TC-L17 直接验证第 5 次触发锁定，无需穷举验证码空间 |
+| logout 的内部删除实现 | 通过接口验证旧 token 401 与重复登出幂等，不绑定 Redis 调用细节 |
 | 同号并发登录多 token | 行为是「每次登录发新 token、旧 token 不失效」，属会话管理设计缺陷延伸，§7 一句话带过 |
 
 ## 6. 规模口径
@@ -111,13 +111,12 @@ POST /user/login ──→ 校验码（equals 比对，不删码）──→ 用
 
 ## 7. 发现与风险（C 层，只记录不改造）
 
-1. **发码无频控**（F2）→ 真实项目需按 phone+IP 滑动窗口，本项目已有 `SlidingWindowInterceptor` 载体可挂。
-2. **验证码不删**（F3）→ 一次性语义缺失，登录成功应 `DEL login:code:{phone}`。
-3. **错码无锁定无计数**（F4+F1）→ 6 位纯数字码 10⁶ 空间，在线暴破可行。
-4. **会话永不过期**（F5）→ 25 天 TTL + 全路径滑动续期，实际是「只要用过就永在」。
-5. **logout 未实现**（F6）→ 实现后补 2 条用例。
-6. **`isCodeInvalid` 死代码**（F10）→ login 不校验码格式；属清理项。
-7. **验证码只打日志**（教学设定）→ 真实项目走短信通道；pytest 方案 A 直连 Redis 不受影响。
+1. **发码幂等冷却已落地**：独立冷却 Key 用 `SET NX EX 60` 抵御重复点击与网络重试；真实部署还应叠加小时级手机号/IP/设备限流。
+2. **验证码原子消费已落地**：Lua 把比较与删除合成一个原子动作，堵住并发复用。
+3. **错码锁定已落地**：5 次失败后锁定 5 分钟，计数与锁定由同一 Lua 完成。
+4. **会话已收敛**：30 分钟滑动 TTL；logout 幂等删除当前 token。
+5. **验证码格式校验已接入**：非法格式不进入 Redis 状态机。
+6. **敏感日志已清理**：不再输出验证码明文；pytest 通过 Redis fixture 取码。
 
 ## 8. 与地图其他票的关系
 

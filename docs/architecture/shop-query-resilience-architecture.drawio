@@ -1,0 +1,169 @@
+<mxfile host="Electron" agent="Codex">
+  <diagram id="shop-query-resilience" name="商铺查询容错架构">
+    <mxGraphModel dx="2020" dy="1201" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1800" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=26;fontStyle=1;fontColor=#1F2937;" value="商铺详情查询：舱壁、熔断、重试与多级缓存架构" vertex="1">
+          <mxGeometry height="50" width="1180" x="310" y="20" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;fontSize=14;fontColor=#64748B;" value="固定调用顺序：入口舱壁（外） → Redis 熔断 → 只读重试 → L1 / L2 / DB" vertex="1">
+          <mxGeometry height="30" width="940" x="430" y="70" as="geometry" />
+        </mxCell>
+        <mxCell id="api-zone" parent="1" style="swimlane;html=1;rounded=1;startSize=38;horizontal=1;fillColor=#EFF6FF;strokeColor=#60A5FA;fontColor=#1E3A8A;fontStyle=1;fontSize=16;swimlaneFillColor=#DBEAFE;" value="API 入口层" vertex="1">
+          <mxGeometry height="570" width="300" x="40" y="120" as="geometry" />
+        </mxCell>
+        <mxCell id="global-handler" parent="api-zone" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FEE2E2;strokeColor=#DC2626;fontColor=#7F1D1D;fontSize=14;" value="&lt;b&gt;WebExceptionAdvice&lt;/b&gt;&lt;br&gt;HTTP 503 · SYS_BUSY" vertex="1">
+          <mxGeometry height="70" width="220" x="40" y="447.5" as="geometry" />
+        </mxCell>
+        <mxCell id="resilience-zone" parent="1" style="swimlane;html=1;rounded=1;startSize=38;horizontal=1;fillColor=#FFF7ED;strokeColor=#FB923C;fontColor=#7C2D12;fontStyle=1;fontSize=16;swimlaneFillColor=#FFEDD5;" value="容错编排层" vertex="1">
+          <mxGeometry height="570" width="430" x="380" y="120" as="geometry" />
+        </mxCell>
+        <mxCell id="db-bulkhead" parent="resilience-zone" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#D97706;fontColor=#78350F;fontSize=14;" value="&lt;b&gt;dbFallbackBulkhead&lt;/b&gt;&lt;br&gt;信号量 20 · wait=0&lt;br&gt;对齐 Hikari 连接池" vertex="1">
+          <mxGeometry height="105" width="140" x="145" y="430" as="geometry" />
+        </mxCell>
+        <mxCell id="fallback" parent="resilience-zone" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE7F3;strokeColor=#DB2777;fontColor=#831843;fontSize=14;" value="&lt;b&gt;queryByIdFallback&lt;/b&gt;&lt;br&gt;Redis 异常 / 熔断打开&lt;br&gt;不再访问故障中的缓存" vertex="1">
+          <mxGeometry height="90" width="200" x="115" y="310" as="geometry" />
+        </mxCell>
+        <mxCell id="e15" edge="1" parent="resilience-zone" source="fallback" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=2;strokeColor=#D97706;endArrow=block;endFill=1;" target="db-bulkhead" value="申请 DB 许可">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="breaker" parent="resilience-zone" style="rhombus;whiteSpace=wrap;html=1;fillColor=#FED7AA;strokeColor=#EA580C;fontColor=#7C2D12;fontSize=14;" value="&lt;b&gt;redisBreaker&lt;/b&gt;&lt;br&gt;CLOSED / OPEN / HALF_OPEN&lt;br&gt;&lt;font color=&quot;#475569&quot;&gt;只处理缓存依赖异常&lt;/font&gt;" vertex="1">
+          <mxGeometry height="120" width="280" x="75" y="170" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" edge="1" parent="resilience-zone" source="breaker" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=2;strokeColor=#DB2777;endArrow=block;endFill=1;" target="fallback" value="OPEN / 最终异常">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="cache-zone" parent="1" style="swimlane;html=1;rounded=1;startSize=38;horizontal=1;fillColor=#F0FDF4;strokeColor=#4ADE80;fontColor=#14532D;fontStyle=1;fontSize=16;swimlaneFillColor=#DCFCE7;" value="多级缓存层" vertex="1">
+          <mxGeometry height="570" width="520" x="850" y="120" as="geometry" />
+        </mxCell>
+        <mxCell id="retry" parent="cache-zone" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DCFCE7;strokeColor=#16A34A;fontColor=#14532D;fontSize=14;" value="&lt;b&gt;cacheQueryRetry&lt;/b&gt;&lt;br&gt;最多 2 次 · 100ms 退避&lt;br&gt;&lt;font color=&quot;#475569&quot;&gt;只读幂等路径&lt;/font&gt;" vertex="1">
+          <mxGeometry height="75" width="430" x="45" y="170" as="geometry" />
+        </mxCell>
+        <mxCell id="rebuild" parent="cache-zone" style="rounded=1;whiteSpace=wrap;html=1;dashed=1;fillColor=#F0FDFA;strokeColor=#0F766E;fontColor=#134E4A;fontSize=13;" value="异步重建&lt;br&gt;JVM key 去重 + 分布式锁&lt;br&gt;版本校验后写回" vertex="1">
+          <mxGeometry height="75" width="190" x="45" y="472.5" as="geometry" />
+        </mxCell>
+        <mxCell id="Nvtexmqttdllyz59csK--8" edge="1" parent="cache-zone" style="endArrow=classic;html=1;rounded=0;exitX=0;exitY=1;exitDx=0;exitDy=0;entryX=0.537;entryY=0.02;entryDx=0;entryDy=0;entryPerimeter=0;" value="逻辑过期">
+          <mxGeometry height="50" relative="1" width="50" x="-0.6784" y="-8" as="geometry">
+            <mxPoint as="offset" />
+            <mxPoint x="285" y="418.5" as="sourcePoint" />
+            <mxPoint x="147.0300000000002" y="472.5" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="data-zone" parent="1" style="swimlane;html=1;rounded=1;startSize=38;horizontal=1;fillColor=#F8FAFC;strokeColor=#94A3B8;fontColor=#334155;fontStyle=1;fontSize=16;swimlaneFillColor=#E2E8F0;" value="数据与基础设施" vertex="1">
+          <mxGeometry height="570" width="340" x="1410" y="120" as="geometry" />
+        </mxCell>
+        <mxCell id="client" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#3B82F6;fontColor=#1E3A8A;fontStyle=1;fontSize=15;" value="客户端 / 前端" vertex="1">
+          <mxGeometry height="60" width="220" x="80" y="205" as="geometry" />
+        </mxCell>
+        <mxCell id="controller" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#2563EB;fontColor=#1E3A8A;fontSize=15;" value="&lt;b&gt;ShopController&lt;/b&gt;&lt;br&gt;GET /shop/{id}" vertex="1">
+          <mxGeometry height="70" width="220" x="80" y="315" as="geometry" />
+        </mxCell>
+        <mxCell id="Nvtexmqttdllyz59csK--3" edge="1" parent="1" source="entry-bulkhead" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0;entryY=0.5;entryDx=0;entryDy=0;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;" target="service">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="370" y="390" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="Nvtexmqttdllyz59csK--4" connectable="0" parent="Nvtexmqttdllyz59csK--3" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" value="获取许可" vertex="1">
+          <mxGeometry relative="1" x="-0.2514" y="-1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="entry-bulkhead" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#D97706;fontColor=#78350F;fontSize=14;" value="&lt;b&gt;cacheBulkhead&lt;/b&gt;&lt;br&gt;信号量 50 · wait=0&lt;br&gt;&lt;font color=&quot;#475569&quot;&gt;最外层容量保护&lt;/font&gt;" vertex="1">
+          <mxGeometry height="90" width="220" x="80" y="435" as="geometry" />
+        </mxCell>
+        <mxCell id="service" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFEDD5;strokeColor=#EA580C;fontColor=#7C2D12;fontStyle=1;fontSize=15;" value="&lt;b&gt;ShopServiceImpl.queryById&lt;/b&gt;" vertex="1">
+          <mxGeometry height="60" width="340" x="425" y="205" as="geometry" />
+        </mxCell>
+        <mxCell id="l1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D1FAE5;strokeColor=#059669;fontColor=#064E3B;fontSize=14;" value="&lt;b&gt;L1 · Caffeine&lt;/b&gt;&lt;br&gt;JVM 本地缓存 · 30s&lt;br&gt;命中：直接返回" vertex="1">
+          <mxGeometry height="85" width="190" x="895" y="455" as="geometry" />
+        </mxCell>
+        <mxCell id="l2" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#CCFBF1;strokeColor=#0D9488;fontColor=#134E4A;fontSize=14;" value="&lt;b&gt;L2 · Redis&lt;/b&gt;&lt;br&gt;逻辑过期 + 空值保护&lt;br&gt;过期：返回旧值并异步重建" vertex="1">
+          <mxGeometry height="85" width="190" x="1135" y="455" as="geometry" />
+        </mxCell>
+        <mxCell id="mutex" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#7C3AED;fontColor=#4C1D95;fontSize=14;" value="&lt;b&gt;Redisson 互斥锁&lt;/b&gt;&lt;br&gt;L1/L2 miss 防击穿&lt;br&gt;等待上限 1s" vertex="1">
+          <mxGeometry height="80" width="190" x="1135" y="590" as="geometry" />
+        </mxCell>
+        <mxCell id="redis" parent="1" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#FEE2E2;strokeColor=#DC2626;fontColor=#7F1D1D;fontSize=14;" value="&lt;b&gt;Redis&lt;/b&gt;&lt;br&gt;cache:shop:{id}" vertex="1">
+          <mxGeometry height="90" width="220" x="1470" y="280" as="geometry" />
+        </mxCell>
+        <mxCell id="mysql" parent="1" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#DBEAFE;strokeColor=#2563EB;fontColor=#1E3A8A;fontSize=14;" value="&lt;b&gt;MySQL&lt;/b&gt;&lt;br&gt;商铺事实源" vertex="1">
+          <mxGeometry height="90" width="220" x="1470" y="485" as="geometry" />
+        </mxCell>
+        <mxCell id="observability" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1F5F9;strokeColor=#64748B;fontColor=#334155;fontSize=14;" value="&lt;b&gt;可观测性&lt;/b&gt;　TraceId/MDC　·　hmdp.cache.hit　·　hmdp.resilience.fallback　·　Resilience4j 状态/舱壁指标" vertex="1">
+          <mxGeometry height="70" width="990" x="380" y="770" as="geometry" />
+        </mxCell>
+        <mxCell id="legend" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;fontSize=13;fontColor=#475569;" value="&lt;b&gt;图例&lt;/b&gt;　&lt;font color=&quot;#15803D&quot;&gt;绿色：正常缓存路径&lt;/font&gt;　　&lt;font color=&quot;#C2410C&quot;&gt;橙色：容错控制&lt;/font&gt;　　&lt;font color=&quot;#BE123C&quot;&gt;红/粉：拒绝或降级路径&lt;/font&gt;" vertex="1">
+          <mxGeometry height="40" width="900" x="450" y="870" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" edge="1" parent="1" source="client" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;strokeColor=#2563EB;endArrow=block;endFill=1;" target="controller" value="HTTP">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="controller" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=2;strokeColor=#2563EB;endArrow=block;endFill=1;" target="entry-bulkhead" value="进入接口">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="1" source="entry-bulkhead" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=2;strokeColor=#DC2626;endArrow=block;endFill=1;" target="global-handler" value="许可耗尽">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" edge="1" parent="1" source="service" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=2;strokeColor=#EA580C;endArrow=block;endFill=1;" target="breaker" value="Service 代理">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" edge="1" parent="1" source="breaker" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=2;strokeColor=#16A34A;endArrow=block;endFill=1;entryX=0;entryY=0.75;entryDx=0;entryDy=0;" target="retry" value="CLOSED / HALF_OPEN">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="895" y="338.75" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e8" edge="1" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=2;strokeColor=#16A34A;endArrow=block;endFill=1;" target="l1" value="第 1 层">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="990" y="380" as="sourcePoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e9" edge="1" parent="1" source="l1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=2;strokeColor=#0D9488;endArrow=block;endFill=1;" target="l2" value="miss">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e10" edge="1" parent="1" source="l2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=2;strokeColor=#82b366;endArrow=block;endFill=1;fillColor=#d5e8d4;" target="redis" value="GET / SET">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1380" y="497.5" />
+              <mxPoint x="1380" y="325" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e11" edge="1" parent="1" source="l2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=2;strokeColor=#7C3AED;endArrow=block;endFill=1;" target="mutex" value="miss">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12" edge="1" parent="1" source="mutex" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=2;strokeColor=#2563EB;endArrow=block;endFill=1;" target="mysql" value="持锁回源">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Nvtexmqttdllyz59csK--9" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" value="线程池" vertex="1">
+          <mxGeometry height="60" width="540" x="840" y="700" as="geometry" />
+        </mxCell>
+        <mxCell id="Nvtexmqttdllyz59csK--10" edge="1" parent="1" source="rebuild" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0.278;entryY=0.039;entryDx=0;entryDy=0;entryPerimeter=0;" target="Nvtexmqttdllyz59csK--9">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Nvtexmqttdllyz59csK--11" edge="1" parent="1" source="Nvtexmqttdllyz59csK--9" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0.5;entryY=1;entryDx=0;entryDy=0;entryPerimeter=0;" target="mysql">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Nvtexmqttdllyz59csK--13" edge="1" parent="1" source="db-bulkhead" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" target="global-handler">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Nvtexmqttdllyz59csK--18" connectable="0" parent="Nvtexmqttdllyz59csK--13" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" value="许可耗尽" vertex="1">
+          <mxGeometry relative="1" x="-0.1289" y="2" as="geometry">
+            <mxPoint y="-1" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="Nvtexmqttdllyz59csK--22" edge="1" parent="1" source="db-bulkhead" style="shape=flexArrow;endArrow=classic;html=1;rounded=0;exitX=0.99;exitY=0.451;exitDx=0;exitDy=0;exitPerimeter=0;entryX=0;entryY=0;entryDx=0;entryDy=60;entryPerimeter=0;fillColor=#f8cecc;strokeColor=#b85450;" target="mysql" value="">
+          <mxGeometry height="50" relative="1" width="50" as="geometry">
+            <mxPoint x="710" y="630" as="sourcePoint" />
+            <mxPoint x="760" y="580" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="Nvtexmqttdllyz59csK--23" connectable="0" parent="Nvtexmqttdllyz59csK--22" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" value="降级回源" vertex="1">
+          <mxGeometry relative="1" x="-0.8416" y="-6" as="geometry">
+            <mxPoint x="22" y="-24" as="offset" />
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

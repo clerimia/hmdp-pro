@@ -1,0 +1,89 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "商铺缓存读链路：一次请求如何走完 L1、L2 与降级",
+    "subtitle": "五条路径：L1 命中 / L2 有效 / 逻辑过期 / 冷 miss / Redis 故障",
+    "locale": "zh-CN",
+    "animation": "trace",
+    "visual_preset": "signal-flow",
+    "quality_profile": "showcase",
+    "output": "review/cache/shop-cache-read-chain.html",
+    "views": [
+      {
+        "id": "fast-path",
+        "label": "快速命中",
+        "focus": ["request", "l1", "redis_read", "fresh_return"],
+        "note": "L1 命中直接返回；L1 miss 后，L2 逻辑有效值进入 L1 再返回。"
+      },
+      {
+        "id": "stale-rebuild",
+        "label": "过期重建",
+        "focus": ["redis_read", "stale_return", "rebuild_dedupe", "rebuild_write"],
+        "note": "逻辑过期旧值只服务当前请求，不写 L1；后台任务完成两级去重后重建 L2。"
+      },
+      {
+        "id": "cold-miss",
+        "label": "冷 miss",
+        "focus": ["redis_read", "cold_lock", "mysql_load", "fill_cache"],
+        "note": "不存在 key 先抢锁、再双检、查库并回填；未持锁者有界等待。"
+      },
+      {
+        "id": "redis-failure",
+        "label": "Redis 故障",
+        "focus": ["redis_read", "redis_fault", "db_fallback", "fallback_return"],
+        "note": "读 Redis 超时后只读重试一次，失败进入熔断与舱壁保护的数据库降级。"
+      }
+    ]
+  },
+  "lanes": [
+    { "id": "cache_lane", "label": "商铺读请求：主链路与 L2 三种状态分支" }
+  ],
+  "mainPath": ["request", "l1", "redis_read", "fresh_return"],
+  "semanticChecks": {
+    "allowedRoots": ["request"],
+    "allowedTerminals": ["fresh_return", "rebuild_write", "fill_cache", "fallback_return"],
+    "requiredPaths": [
+      { "from": "request", "to": "fresh_return" },
+      { "from": "redis_read", "to": "rebuild_write" },
+      { "from": "redis_read", "to": "fill_cache" },
+      { "from": "redis_read", "to": "fallback_return" }
+    ]
+  },
+  "nodes": [
+    { "id": "request", "lane": "cache_lane", "col": 0, "type": "external", "label": "查询商铺", "sublabel": "GET /shop/{id}", "width": 120 },
+    { "id": "fresh_return", "lane": "cache_lane", "col": 5, "type": "backend", "label": "返回有效值", "sublabel": "L1 命中 / L2 新鲜", "width": 130 },
+
+    { "id": "l1", "lane": "cache_lane", "col": 1, "type": "backend", "label": "读 Caffeine L1", "sublabel": "命中即返 · TTL 30s", "width": 136 },
+    { "id": "redis_read", "lane": "cache_lane", "col": 2, "type": "database", "label": "读 Redis L2", "sublabel": "空值 / 逻辑时间 / 异常", "width": 144 },
+
+    { "id": "stale_return", "lane": "cache_lane", "col": 3, "type": "backend", "label": "返回逻辑过期旧值", "sublabel": "仅本次请求 · 不写 L1", "tag": "低延迟", "width": 154, "yOffset": 92 },
+    { "id": "rebuild_dedupe", "lane": "cache_lane", "col": 4, "type": "security", "label": "两级重建去重", "sublabel": "JVM in-flight + Redis 锁", "width": 148, "yOffset": 92 },
+    { "id": "rebuild_write", "lane": "cache_lane", "col": 5, "type": "database", "label": "异步重建 L2", "sublabel": "查库 · 版本校验 · 双 TTL", "width": 152, "yOffset": 92 },
+    { "id": "cold_lock", "lane": "cache_lane", "col": 2, "type": "security", "label": "冷 miss 抢锁 + 双检", "sublabel": "未持锁最多等 1s", "width": 148, "yOffset": 168 },
+    { "id": "mysql_load", "lane": "cache_lane", "col": 3, "type": "database", "label": "查 MySQL 事实源", "sublabel": "值存在 / 不存在", "width": 136, "yOffset": 168 },
+    { "id": "fill_cache", "lane": "cache_lane", "col": 5, "type": "database", "label": "回填并返回", "sublabel": "值：双 TTL；空值：2~4m", "width": 152, "yOffset": 168 },
+
+    { "id": "redis_fault", "lane": "cache_lane", "col": 3, "type": "security", "label": "Redis 超时 / 异常", "sublabel": "800ms · 只读重试 1 次", "width": 140, "yOffset": 244 },
+    { "id": "db_fallback", "lane": "cache_lane", "col": 4, "type": "security", "label": "数据库受限降级", "sublabel": "Bulkhead ≤ 20", "width": 136, "yOffset": 244 },
+    { "id": "fallback_return", "lane": "cache_lane", "col": 5, "type": "database", "label": "返回 DB 真值", "sublabel": "不回写故障 Redis", "width": 134, "yOffset": 244 }
+  ],
+  "edges": [
+    { "id": "request-l1", "from": "request", "to": "l1", "label": "查 L1", "role": "main", "variant": "default" },
+    { "id": "l1-hit", "from": "l1", "to": "fresh_return", "label": "命中", "role": "return", "variant": "emphasis", "route": "up-channel" },
+    { "id": "l1-miss", "from": "l1", "to": "redis_read", "label": "miss", "role": "main", "variant": "default" },
+    { "id": "redis-fresh", "from": "redis_read", "to": "fresh_return", "label": "逻辑有效 · 写 L1", "role": "main", "variant": "emphasis", "route": "up-channel" },
+
+    { "id": "redis-stale", "from": "redis_read", "to": "stale_return", "label": "逻辑过期", "role": "branch", "variant": "emphasis" },
+    { "id": "stale-dedupe", "from": "stale_return", "to": "rebuild_dedupe", "label": "JVM 去重后提交", "role": "async", "variant": "dashed" },
+    { "id": "dedupe-rebuild", "from": "rebuild_dedupe", "to": "rebuild_write", "label": "抢 Redis 锁", "role": "async", "variant": "dashed" },
+
+    { "id": "redis-cold", "from": "redis_read", "to": "cold_lock", "label": "key 不存在", "role": "branch", "variant": "security" },
+    { "id": "lock-db", "from": "cold_lock", "to": "mysql_load", "label": "双检仍 miss", "role": "branch", "variant": "default" },
+    { "id": "db-fill", "from": "mysql_load", "to": "fill_cache", "label": "写双 TTL / L1", "role": "return", "variant": "emphasis" },
+
+    { "id": "redis-error", "from": "redis_read", "to": "redis_fault", "label": "Redis 调用失败", "role": "error", "variant": "security" },
+    { "id": "fault-fallback", "from": "redis_fault", "to": "db_fallback", "label": "熔断降级", "role": "error", "variant": "security" },
+    { "id": "fallback-db", "from": "db_fallback", "to": "fallback_return", "label": "舱壁内查库", "role": "return", "variant": "emphasis" }
+  ]
+}

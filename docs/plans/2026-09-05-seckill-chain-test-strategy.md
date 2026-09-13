@@ -29,7 +29,7 @@
 | 应用层限流：提交 **5 次/秒**（按 userId），查询 **10 次/秒**，两者 key 独立 | `SlidingWindowInterceptor` | 烧光提交配额不影响查询配额（R2 的根据） |
 | 应用层 429 **无** `X-RateLimit-Layer` 头；网关 429 **有**（`gateway-global-token-bucket`） | `SlidingWindowInterceptor:137`、`openresty/nginx.conf:47` | 两层 429 天然可区分，不用猜归属 |
 | 查询被拒只打 `hmdp.ratelimit.fallback{strategy=rejected}`，**不进** `hmdp.seckill.result`；提交被拒打 `result{reason=rate_limited}` | `SlidingWindowInterceptor` | 两类拒绝的指标断言对象不同 |
-| 限流器自身故障 → **fail-open** 放行 + `fallback{strategy=fail_open}`；业务层 fail-closed | `SlidingWindowInterceptor` catch 块 | Redis 全下线时一个场景钉死两层哲学（R7） |
+| 限流器自身故障 → **fail-open** 放行 + `fallback{strategy=fail_open}`；业务层 fail-closed | `SlidingWindowInterceptor` catch 块 | 仅适用于已建立 `UserHolder` 的请求；Redis 全下线时会先由服务端会话层返回 401（R7） |
 | 舱壁/熔断在业务方法之前拦截，`finishSeckill` 从未执行 → **这层拒绝在 `hmdp.seckill.result` 上隐形** | `VoucherOrderServiceImpl#seckillVoucher` 注解 | 舱壁拒绝只能断言 HTTP 503 (SYS_BUSY) + R4J 自身计数 |
 | 网关令牌桶：全局 rate=1000/s、capacity=3000；短锁竞争失败保守拒绝 | `token_bucket.lua`、`nginx.conf` | pytest 客户端发不出 1000 rps → 网关触发归 JMeter；短锁竞态不测 |
 | 测试档位开关 `seckill:test:protection`（FULL/LEGACY/EARLY）带 **3s 本地快照** | `VoucherOrderServiceImpl#oneOrderProtection` | 切档后必须等 3s 再发请求，否则首个请求仍是旧档（C4 的确定性等待） |
@@ -83,7 +83,7 @@ EARLY 是「就算 Lua 去重没了，DB 唯一索引还能兜住」的证据用
 
 **登录态（方案 A）**：pytest setup 用 `phone_pool` + `login_as` 批量登录 **1000 个账号**
 （自动注册，无预置 SQL），token 写 CSV；JMeter 用 CSV Data Set Config 消费 `authorization` 头。
-登录逻辑全项目只有 pytest 一份实现；token TTL 25 天 + 滑动续期，**CSV 生成一次可反复复跑**。
+登录逻辑全项目只有 pytest 一份实现；token TTL 30 分钟 + 滑动续期，长时间压测需在开始前重新生成用户 token CSV。
 
 **流量入口统一走 OpenResty 网关**（80 → proxy 8081）——网关令牌桶本身是被测对象，
 pytest 功能用例的量级（<100 rps）远够不着桶限。
@@ -124,7 +124,7 @@ W6（已结束 + 收敛）并入 C7，不重复计。
 | R2 | 提交/查询配额独立 | 烧光提交配额后查询仍放行；查询 1s 内第 11 次 | 查询 429 + `fallback{strategy=rejected}` 增量 ==1、`seckill.result` **不动** | |
 | R3 | 窗口滑动恢复 | 停 1.1s 重发 | 放行（窗口语义正向验证） | |
 | R5 | 舱壁 + MQ fail-closed | **停 RocketMQ broker** → send 阻塞至超时（≈3s）占满在途许可 → 150 线程集合点齐发 | 混合 503 (SYS_BUSY) / 业务码 5004 (mq_send_error)；**零 success、DB 零新增** | ✔ |
-| R7 | Redis 全下线 fail-closed 完整链 | 停 Redis 容器 → 连发 → 恢复 | ① `fallback{strategy=fail_open}` 增量 ≥1（限流器放行了）② 业务仍拒绝：503/失败、**DB 零新增** ③ 恢复后 `wait_until` 抢券成功 ④ 恢复后四方对账精确等式不破 | ✔ |
+| R7 | Redis 全下线 fail-closed 完整链 | 停 Redis 容器 → 请求 → 恢复 | ① 服务端会话无法确认，登录拦截器先返回 401（不会进入其后的限流器/Lua）② **DB 零新增** ③ 恢复后 `wait_until` 抢券成功 ④ 恢复后四方对账精确等式不破 | ✔ |
 
 R6（网关令牌桶触发）**归 JMeter 场景 2**：集合点 1500 线程超桶，JMeter Assertion 断言
 429 + `X-RateLimit-Layer: gateway-global-token-bucket`。pytest 客户端发不出 1000 rps，不硬造。
@@ -187,7 +187,7 @@ R6（网关令牌桶触发）**归 JMeter 场景 2**：集合点 1500 线程超�
 2. `begin > end` 非法窗口——代码无校验，缺陷现场记录进「发现与风险」，本 map 不改代码（登录票 C 层先例）；
 3. pytest 触发网关令牌桶——客户端能力物理不足，JMeter 覆盖；
 4. 令牌桶短锁竞争的保守拒绝——微秒竞态，同 ①；
-5. fail-open 后「真放行到 Lua 成功」——Redis 全挂 Lua 必败，物理不可分离，R7 断言到「未被 429 拦截」粒度；
+5. Redis 全挂时服务端会话也不可读，登录拦截器先于限流器返回 401；因此 R7 不断言限流 fail-open 指标。该指标需用不破坏登录态 Redis 的局部故障注入另测；
 6. LEGACY 档（Redisson 锁对照）——保留作回滚档位，测试上无独立叙事价值，不建用例；
 7. `getSeckillResult` 的 UNKNOWN 分支——需「排队状态缺失 + DB 查询失败」双故障叠加，构造成本高于叙事价值。
 

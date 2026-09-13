@@ -70,7 +70,7 @@ Timer `hmdp.seckill.latency` → `hmdp_seckill_latency_seconds_*`。
 | `hmdp.resilience.breaker.event` | Counter | `breaker` `kind` | R4J 事件订阅（`observability/ResilienceMetrics`）：`error`=学习期依赖失败，`not_permitted`=熔断打开后快速打回 |
 | `hmdp.resilience.breaker.transition` | Counter | `breaker` `state`(closed/open/half_open) | 熔断状态翻转时刻（状态存续看 `resilience4j_circuitbreaker_state` Gauge） |
 | `hmdp.resilience.retry` | Counter | `retry` `kind` | R4J Retry 事件：`retry`=重试触发，`error`=重试耗尽最终失败 |
-| `hmdp.resilience.fallback` | Counter | `breaker` `kind` | fallbackMethod 手动打点：`not_permitted`/`error`=降级执行，`bulkhead_rejected`=舱壁打回、降级未执行 |
+| `hmdp.resilience.fallback` | Counter | `breaker` `kind` | fallbackMethod 手动打点：`not_permitted`/`error`=降级执行，`bulkhead_rejected`=DB 降级舱壁满载、降级未执行；入口舱壁使用 R4J 原生指标 |
 
 `reason` 取值封闭在 `SeckillMetrics.Reason` 枚举里：
 `success` / `stock_out` / `repeat` / `rate_limited` / `mq_send_error` / `db_degraded` / `system_error`。

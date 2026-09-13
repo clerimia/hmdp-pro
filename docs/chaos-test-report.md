@@ -166,7 +166,7 @@ Redis 恢复后数据完好（AOF 生效），应用自动重连，下单恢复�
 
 因为顺序是「先发事务半消息 → Broker OK → 才执行 Lua」：MQ 挂了就到不了 Lua 那一步，库存根本不碰。这个顺序保证了不会「扣了库存却发不出消息」。
 
-### 3.6 🔴 broker 反复退出 253：tmpfs 属主问题（本轮最顽固的坑）
+### 3.6 broker 反复退出 253：store 属主问题（已改为持久化卷）
 
 **现象**：混沌测试后期 broker 容器反复退出，`exit code 253`，且**启动后先打印 `boot success` 再过几秒退出**——看起来像"启动成功但随即崩溃"。
 
@@ -180,14 +180,16 @@ java.io.FileNotFoundException: /home/rocketmq/store/lock (Permission denied)
 
 **根因**：容器以 `rocketmq` 用户（uid=3000）运行，但 tmpfs 挂载的 `/home/rocketmq/store` 默认由 **root** 创建 → 写不进 lock 文件 → 初始化失败。shutdown 时又因同一权限问题无法持久化配置，抛出一片 `FileNotFoundException`，把真正的初始化异常淹没在后面。
 
-**修复**：compose 里显式指定 tmpfs 属主：
+**当时修复**：compose 里显式指定 tmpfs 属主：
 
 ```yaml
 tmpfs:
   - /home/rocketmq/store:uid=3000,gid=3000
 ```
 
-**关键教训**：不指定属主时行为**不稳定**（有时能起来、有时秒退），这正是它拖了整个下午的原因——几次"看起来修好了"都只是碰巧。凡是用 tmpfs/卷的，属主必须显式固定。
+**2026-09-06 后续修复**：改用 Docker named volume，入口先将 store `chown` 给 uid 3000，再降权启动 Broker。已通过 topic 跨重启保留实测，说明先前的“mmap 不支持挂载卷”判断不成立。
+
+**关键教训**：凡是用 tmpfs/卷的，属主必须显式固定；应以容器内 `broker.log` 的实际异常为准，不要由退出码推断 mmap 能力。
 
 **排查这类问题的手法**：`docker logs` 看不到异常时，把容器内日志 copy 出来看：
 ```bash
@@ -196,7 +198,7 @@ docker cp <container>:/home/rocketmq/logs/rocketmqlogs/broker.log ./broker.log
 
 ### 3.7 事务消息不会触发 topic 自动创建
 
-broker 重启（tmpfs 清空）后，即使重启应用，下单仍报 `No route info of this topic: order-seckill-topic`。
+broker 使用 tmpfs 的历史配置重启后，即使重启应用，下单仍报 `No route info of this topic: order-seckill-topic`。当前 named volume 配置会保留 topic，不再触发该问题。
 
 原因：事务消息实际发往 `RMQ_SYS_TRANS_HALF_TOPIC`，原 topic 只存在于消息 properties 里，broker 不会为它自动创建路由，因此 `autoCreateTopicEnable=true` 对事务消息**不生效**。
 

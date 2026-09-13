@@ -136,7 +136,7 @@ def login_as(phone, http, redis_cli, cache):
 - 失效（两条触发路径）：
   1. **主动**：用例测"登出 / token 过期 / 篡改 token"时必须 `token_cache.invalidate(phone)`，否则下一条用例拿到脏 token。
   2. **被动**：`ApiClient` 检测到响应 `http_status == 401` 时，抛 `TokenExpired(phone)`；`login` 工厂捕获后 invalidate + 重新登录 + 原请求重试一次（**只重试一次**，二次仍 401 就真失败）。
-- 注意：token TTL 是 **36000 分钟（25 天）**，且 `RefreshTokenInterceptor` 每次请求都会续期，所以正常跑不会自然过期。失效处理是为了防御性正确，不是为了兜底常事。
+- token TTL 是 **30 分钟**，`RefreshTokenInterceptor` 对活跃会话滑动续期；测试用 DEL 注入失效状态，不等待自然过期。
 
 ### 多用户 fixture：并发场景的刚需
 

@@ -18,7 +18,7 @@ spring:
       # 取 20 = 领券入口信号量(100) 的 1/5，保证非领券查询仍有连接可用
       maximum-pool-size: 20
   redis:
-    host: your_redis_host
+    host: 127.0.0.1
     port: 6379
     # password: your_redis_password
     # 【本次改造最关键的一项】Lettuce 默认是 60s 命令超时。
@@ -101,8 +101,8 @@ resilience4j:
         # 算进失败率会把健康的依赖误熔断（这是 P0 先建异常体系的原因）
         ignore-exceptions:
           - com.hmdp.exception.BusinessException
-          # 舱壁拒绝 ≠ 依赖故障：隔离层打回的请求不该污染失败率，
-          # 否则高峰期限流打满反而会把健康的 redisBreaker 打开
+          # 舱壁拒绝 ≠ 依赖故障。店铺查询已把 cacheBulkhead 放在 Controller 外层，
+          # 此项继续保护其他共用 redisBreaker、且把两个注解放在同一方法上的链路。
           - io.github.resilience4j.bulkhead.BulkheadFullException
       # ===== P2：只管 RocketMQ 发送通道（订单创建消息）=====
       # MQ 抖动不应熔断 Redis（入口 Lua）与 DB（落库），按依赖拆分爆炸半径
@@ -138,7 +138,8 @@ resilience4j:
       seckillBulkhead:
         max-concurrent-calls: 100   # Tomcat 默认 200 线程，领券最多占用一半，给查询接口留容量
         max-wait-duration: 0        # 许可耗尽立即拒，排队只会让延迟不可控
-      # 缓存查询入口：同理，同步接口用信号量
+      # 缓存查询入口：注解放在 ShopController，位于 ShopService 的 redisBreaker 外层。
+      # 入口满载直接 503，不会进入 Redis fallback 或绕道回源 DB。
       cacheBulkhead:
         max-concurrent-calls: 50
         max-wait-duration: 0
