@@ -161,7 +161,7 @@ class AuthedClient:
     """带登录态的客户端视图：自动注入 authorization 头；401 时回调重登并重试一次。
 
     重登回调由 conftest 的 login 工厂提供（invalidate + 重新登录 + 原地 refresh AuthContext）。
-    二次仍 401 抛 TokenExpired——token TTL 25 天且滑动续期，正常跑不会自然过期，
+    二次仍 401 抛 TokenExpired——token TTL 30 分钟且滑动续期，正常跑不会自然过期，
     这是防御性正确，不是兜底常事（框架结构票 §2）。
     """
 

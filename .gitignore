@@ -48,6 +48,10 @@ src/main/resources/application-local*.yaml
 docker-compose.override.yml
 .env
 
+### JMeter 本地压测产物 ###
+loadtest/cache/results/
+jmeter.log
+
 ### hm-dianping-frontend：nginx 部署目录，只保留 H5 被测页面 ###
 hm-dianping-frontend/logs/
 hm-dianping-frontend/temp/

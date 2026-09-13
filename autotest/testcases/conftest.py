@@ -15,6 +15,12 @@ fixture 分层：
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import time
+import urllib.request
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -22,7 +28,7 @@ from typing import List
 
 import pytest
 
-from api import user_api, voucher_api
+from api import order_api, shop_api, user_api, voucher_api
 from common import keys
 from common.client import ApiClient, AuthContext, AuthedClient
 from common.config import Config
@@ -30,6 +36,7 @@ from common.db import DbHelper
 from common.metrics import MetricsHelper
 from common.phone_pool import PhonePool
 from common.redis_helper import RedisHelper
+from common.wait import wait_until
 
 log = logging.getLogger(__name__)
 
@@ -138,6 +145,10 @@ def login(http, redis_cli, token_cache):
     「登录态正确写入 Redis hash」。
     """
     def _do_login(phone: str, into: AuthContext | None = None) -> AuthContext:
+        # 上一次 pytest 进程可能已登录并消费 code，但 60s cooldown 仍在。
+        # 此时 /user/code 会幂等返回成功却不补发，导致新进程永远取不到验证码。
+        if not redis_cli.exists(keys.login_code(phone)):
+            redis_cli.delete(keys.login_code_cooldown(phone))
         resp = user_api.send_code(http, phone)
         assert resp.http_status == 200 and resp.body.get("success"), f"发码失败: {resp.body}"
         code = redis_cli.wait_key(keys.login_code(phone))
@@ -202,6 +213,11 @@ def sms_code(http, redis_cli):
     覆盖语义的用例 TC-S05 自己再发）。
     """
     def _make(phone: str) -> str:
+        redis_cli.delete(
+            keys.login_code_cooldown(phone),
+            keys.login_attempts(phone),
+            keys.login_locked(phone),
+        )
         resp = user_api.send_code(http, phone)
         assert resp.http_status == 200 and resp.body.get("success"), f"发码失败: {resp.body}"
         key = keys.login_code(phone)
@@ -262,6 +278,250 @@ def new_seckill_voucher(http, db, redis_cli, cfg):
             yield vid
         finally:
             _teardown_voucher(db, redis_cli, vid)
+
+    return _make
+
+
+@pytest.fixture
+def set_window(db, redis_cli):
+    """重设活动窗口，并清掉必须随窗口一起失效的预热数据。"""
+    def _set(voucher_id: int, *, begin_s: int, end_s: int) -> None:
+        affected = db.execute(
+            "UPDATE tb_seckill_voucher "
+            "SET begin_time = DATE_ADD(NOW(), INTERVAL %s SECOND), "
+            "end_time = DATE_ADD(NOW(), INTERVAL %s SECOND) "
+            "WHERE voucher_id = %s",
+            (begin_s, end_s, voucher_id),
+        )
+        assert affected == 1, f"秒杀券不存在，无法设置窗口: voucher_id={voucher_id}"
+        redis_cli.delete(keys.seckill_meta(voucher_id), keys.seckill_stock(voucher_id))
+
+    return _set
+
+
+@pytest.fixture
+def start_voucher(http, db, redis_cli, set_window, reset_rate_limit):
+    """经真实预热路径把券从未开始推进到活动中，保留安全预热的库存。"""
+    def _start(voucher_id: int, auth: AuthContext, *, begin_s: int = -1,
+               end_s: int = 3600) -> None:
+        set_window(voucher_id, begin_s=60, end_s=max(end_s, 120))
+        reset_rate_limit(auth.user_id)
+        warm_response = order_api.seckill(http, voucher_id, auth)
+        assert warm_response.http_status == 200 and warm_response.code == 1007, (
+            f"活动前预热失败: {warm_response.body}"
+        )
+        assert redis_cli.exists(keys.seckill_stock(voucher_id)), (
+            f"活动前未生成库存 key: voucher_id={voucher_id}"
+        )
+
+        affected = db.execute(
+            "UPDATE tb_seckill_voucher "
+            "SET begin_time = DATE_ADD(NOW(), INTERVAL %s SECOND), "
+            "end_time = DATE_ADD(NOW(), INTERVAL %s SECOND) "
+            "WHERE voucher_id = %s",
+            (begin_s, end_s, voucher_id),
+        )
+        assert affected == 1, f"秒杀券不存在，无法开始活动: voucher_id={voucher_id}"
+        # 库存是活动开始前经真实入口预热所得。窗口推进后同步准备 meta，模拟正式
+        # 开抢前的预热状态；若这里只 DEL meta，首波并发会争 tryLock(0)，未拿锁的
+        # 请求会暂时读到 null 并被误判成“非秒杀券”，那测到的是 fixture 竞态。
+        window = db.query_one(
+            "SELECT CAST(UNIX_TIMESTAMP(begin_time) * 1000 AS UNSIGNED) AS begin_ms, "
+            "CAST(UNIX_TIMESTAMP(end_time) * 1000 AS UNSIGNED) AS end_ms "
+            "FROM tb_seckill_voucher WHERE voucher_id = %s",
+            (voucher_id,),
+        )
+        meta_key = keys.seckill_meta(voucher_id)
+        redis_cli.delete(meta_key)
+        redis_cli.hset(meta_key, "begin", str(window["begin_ms"]))
+        redis_cli.hset(meta_key, "end", str(window["end_ms"]))
+        redis_cli.expire(meta_key, 24 * 60 * 60)
+        reset_rate_limit(auth.user_id)
+
+    return _start
+
+
+@pytest.fixture
+def end_voucher(db, redis_cli):
+    """结束已开始的活动；保留库存账，只失效窗口 meta。"""
+    def _end(voucher_id: int, *, seconds_ago: int = 1) -> None:
+        affected = db.execute(
+            "UPDATE tb_seckill_voucher "
+            "SET end_time = DATE_SUB(NOW(), INTERVAL %s SECOND) "
+            "WHERE voucher_id = %s",
+            (seconds_ago, voucher_id),
+        )
+        assert affected == 1, f"秒杀券不存在，无法结束活动: voucher_id={voucher_id}"
+        redis_cli.delete(keys.seckill_meta(voucher_id))
+
+    return _end
+
+
+@pytest.fixture
+def protection_mode(redis_cli):
+    """切换一人一券保护档位，并跨过应用内 3 秒快照；退出后恢复 FULL。"""
+    @contextmanager
+    def _use(mode: str):
+        normalized = mode.strip().upper()
+        redis_cli.set("seckill:test:protection", normalized)
+        refresh_at = time.monotonic() + 3.2
+        wait_until(lambda: time.monotonic() >= refresh_at, timeout=4, interval=0.05,
+                   desc=f"等待保护档位切换为 {normalized}")
+        try:
+            yield
+        finally:
+            redis_cli.set("seckill:test:protection", "FULL")
+            restore_at = time.monotonic() + 3.2
+            wait_until(lambda: time.monotonic() >= restore_at, timeout=4, interval=0.05,
+                       desc="等待保护档位恢复为 FULL")
+
+    return _use
+
+
+@pytest.fixture
+def stop_service(cfg):
+    """临时停止指定 Compose 依赖；无论用例结果如何都启动并等到 healthy。"""
+    compose_root = Path(__file__).resolve().parents[2]
+    allowed = {"redis", "rocketmq-broker"}
+
+    def compose(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["docker", "compose", *args],
+            cwd=compose_root,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+    def container_id(service: str) -> str:
+        result = compose("ps", "-q", service)
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip()
+
+    def is_healthy(service: str) -> bool:
+        cid = container_id(service)
+        if not cid:
+            return False
+        result = subprocess.run(
+            ["docker", "inspect", "--format", "{{.State.Health.Status}}", cid],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        return result.returncode == 0 and result.stdout.strip() == "healthy"
+
+    def restart_local_app() -> None:
+        # Redis 全停后容器 healthy 也不等于应用内的 Redisson/Lettuce 与 MQ
+        # 消费线程已全部恢复；重启应用把故障恢复边界变成可验证的就绪点。
+        # 只允许终止当前 8081 且命令行明确属于本工作区的进程树。
+        workspace_pattern = str(compose_root).replace("'", "''")
+        stop_script = (
+            "$listener=Get-NetTCPConnection -LocalPort 8081 -State Listen "
+            "-ErrorAction Stop|Select-Object -First 1;"
+            "$app=Get-CimInstance Win32_Process -Filter "
+            "\"ProcessId=$($listener.OwningProcess)\";"
+            f"if($app.CommandLine -notlike '*{workspace_pattern}*'){{exit 23}};"
+            "$parent=Get-CimInstance Win32_Process -Filter "
+            "\"ProcessId=$($app.ParentProcessId)\";"
+            "Stop-Process -Id $app.ProcessId -Force;"
+            f"if($parent.CommandLine -like '*{workspace_pattern}*'){{"
+            "Stop-Process -Id $parent.ProcessId -Force -ErrorAction SilentlyContinue}"
+        )
+        stopped = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", stop_script],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        assert stopped.returncode == 0, stopped.stderr
+
+        env = os.environ.copy()
+        env.update({
+            "SPRING_DATASOURCE_URL": (
+                f"jdbc:mysql://{cfg.mysql.host}:{cfg.mysql.port}/{cfg.mysql.database}"
+                "?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true"
+            ),
+            "SPRING_DATASOURCE_USERNAME": str(cfg.mysql.user),
+            "SPRING_DATASOURCE_PASSWORD": str(cfg.mysql.password),
+            "SPRING_REDIS_HOST": str(cfg.redis.host),
+            "SPRING_REDIS_PORT": str(cfg.redis.port),
+        })
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        maven = shutil.which("mvn.cmd") or shutil.which("mvn")
+        assert maven, "PATH 中找不到 Maven，无法在 broker 恢复后重启应用"
+        stdout_path = compose_root / "target" / "pytest-app.out.log"
+        stderr_path = compose_root / "target" / "pytest-app.err.log"
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        with stdout_path.open("ab") as stdout_log, stderr_path.open("ab") as stderr_log:
+            subprocess.Popen(
+                [maven, "spring-boot:run"],
+                cwd=compose_root,
+                env=env,
+                stdout=stdout_log,
+                stderr=stderr_log,
+                creationflags=creationflags,
+            )
+
+        def app_is_up() -> bool:
+            try:
+                with urllib.request.urlopen(
+                        f"{cfg.base_url.rstrip('/')}/actuator/health", timeout=2) as response:
+                    return response.status == 200 and b'"UP"' in response.read()
+            except Exception:
+                return False
+
+        wait_until(app_is_up, timeout=60, interval=0.5, desc="等待应用重启")
+
+    @contextmanager
+    def _stop(service: str):
+        assert service in allowed, f"不允许停止未列入白名单的服务: {service}"
+        stopped = compose("stop", service)
+        assert stopped.returncode == 0, stopped.stderr
+        wait_until(lambda: not container_id(service), timeout=15, interval=0.2,
+                   desc=f"等待 {service} 停止")
+        try:
+            yield
+        finally:
+            started = compose("start", service)
+            assert started.returncode == 0, started.stderr
+            wait_until(lambda: is_healthy(service), timeout=45, interval=1,
+                       desc=f"等待 {service} 恢复健康")
+            if service == "redis":
+                restart_local_app()
+
+    return _stop
+
+
+@pytest.fixture
+def new_shop(http, db, redis_cli):
+    """动态创建独立商铺，隔离每条缓存用例的 L1/L2 与指标窗口。"""
+    @contextmanager
+    def _make(name: str | None = None):
+        shop = {
+            "name": name or f"pytest-shop-{uuid.uuid4().hex[:8]}",
+            "typeId": 1,
+            "images": "pytest.jpg",
+            "area": "pytest-area",
+            "address": "pytest-address",
+            "x": 121.0,
+            "y": 31.0,
+            "avgPrice": 20,
+            "sold": 0,
+            "comments": 0,
+            "score": 50,
+            "openHours": "08:00-22:00",
+        }
+        resp = http.post("/shop", json=shop)
+        assert resp.http_status == 200 and resp.data, f"创建测试商铺失败: {resp.body}"
+        shop_id = int(resp.data)
+        try:
+            yield shop_id
+        finally:
+            redis_cli.delete(keys.cache_shop(shop_id), keys.lock_shop(shop_id))
+            db.execute("DELETE FROM tb_shop WHERE id = %s", (shop_id,))
 
     return _make
 

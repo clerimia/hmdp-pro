@@ -11,7 +11,10 @@ from __future__ import annotations
 
 # ---- 登录（RedisConstants）----
 LOGIN_CODE = "login:code:"        # LOGIN_CODE_KEY，TTL 2min
-LOGIN_TOKEN = "login:token:"      # LOGIN_USER_KEY，hash（字段 id/nickName/avatar），TTL 36000min
+LOGIN_TOKEN = "login:token:"      # LOGIN_USER_KEY，hash（字段 id/nickName/avatar），TTL 30min
+LOGIN_ATTEMPTS = "login:attempts:"
+LOGIN_LOCKED = "login:locked:"
+LOGIN_CODE_COOLDOWN = "login:code:cooldown:"
 
 # ---- 两级缓存（RedisConstants）----
 CACHE_SHOP = "cache:shop:"        # CACHE_SHOP_KEY，RedisData JSON，物理 TTL 5400s
@@ -36,6 +39,18 @@ SECKILL_TEST_PROTECTION = "seckill:test:protection"  # FULL/LEGACY/EARLY，切�
 
 def login_code(phone: str) -> str:
     return LOGIN_CODE + phone
+
+
+def login_attempts(phone: str) -> str:
+    return LOGIN_ATTEMPTS + phone
+
+
+def login_locked(phone: str) -> str:
+    return LOGIN_LOCKED + phone
+
+
+def login_code_cooldown(phone: str) -> str:
+    return LOGIN_CODE_COOLDOWN + phone
 
 
 def login_token(token: str) -> str:
