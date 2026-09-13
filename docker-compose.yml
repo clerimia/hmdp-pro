@@ -44,7 +44,7 @@ services:
     # volatile-lru 而非 allkeys-lru：seckill:stock:* / seckill:order:* 无 TTL，绝不能被驱逐
     # （库存被逐 = 凭空消失；若再按落后的 DB 值回填会超卖）。其余 key 都带 TTL，是天然淘汰候选。
     # 生产加固：不可丢数据拆独立实例 + noeviction + 合理 maxmemory
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy volatile-lru
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy volatile-lru --enable-debug-command yes
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -122,6 +122,9 @@ services:
 
   rocketmq-broker:
     image: apache/rocketmq:4.9.7
+    # named volume 首次创建为 root:root；入口只做属主初始化，
+    # Broker 进程随后立即降权为镜像内的 rocketmq(uid=3000)。
+    user: root
     ports:
       - "10909:10909"
       - "10911:10911"
@@ -132,18 +135,18 @@ services:
       # 探测抛 NPE → 消费全部 NoClassDefFoundError 且 broker 无 ERROR 日志，表现为「能发不能收」
       # （producer 全部成功、offset 正常、consumer 一条收不到）。堆已显式固定，关闭容器感知无副作用
       JAVA_OPT_EXT: "-Xms1g -Xmx1g -Xmn512m -XX:-UseContainerSupport"
-    # command 必须用数组形式：字符串形式会被整体当成单个参数（无日志退出 253）
-    command: ["sh", "mqbroker", "-n", "rocketmq-namesrv:9876", "-c", "/home/rocketmq/conf/broker.conf"]
+    command:
+      - sh
+      - -c
+      - >-
+        chown -R rocketmq:rocketmq /home/rocketmq/store &&
+        exec runuser -u rocketmq -- sh mqbroker -n rocketmq-namesrv:9876
+        -c /home/rocketmq/conf/broker.conf
     volumes:
       - ./docker/rocketmq/broker.conf:/home/rocketmq/conf/broker.conf:ro
-    # store 只能用 tmpfs（uid=3000 必须显式指定）：
-    #   - 挂载卷一律退出 253：RocketMQ 的 commitlog mmap 不被 Docker Desktop 卷支持
-    #     （已排除 cgroup bug / 卷属主两个假设，勿重复排查）
-    #   - 不指定 uid 时 tmpfs 由 root 创建 → broker 卡 store/lock 权限后退出 253，
-    #     stdout 正常、真异常只在容器内 broker.log（Failed to initialize），极具迷惑性
-    #   - 代价：broker 重启丢 topic/位点/消息 → 之后必须重启应用（消费者会因 topic 不存在丢前几单）
-    tmpfs:
-      - /home/rocketmq/store:uid=3000,gid=3000
+      # Docker named volume 位于 VM 的 Linux 文件系统，可持久化
+      # commitlog/topic/消费位点，并从镜像目录继承 UID 3000 属主。
+      - rocketmq-broker-store:/home/rocketmq/store
     depends_on:
       - rocketmq-namesrv
     healthcheck:
@@ -158,3 +161,4 @@ volumes:
   prometheus-data:
   grafana-data:
   rocketmq-namesrv-data:
+  rocketmq-broker-store:
