@@ -13,6 +13,9 @@ public class CacheMetrics {
 
     public static final String CACHE_HIT = "hmdp.cache.hit";
 
+    /** 写后缓存失效的最终结果（内部短重试成功仍记 ok，仅重试耗尽记 error） */
+    public static final String CACHE_EVICT = "hmdp.cache.evict";
+
     /** 写回侧版本核验：快照落后于 DB，放弃写回（治"成功的脏写"） */
     public static final String CACHE_STALE_SKIP = "hmdp.cache.stale_skip";
 
@@ -42,5 +45,10 @@ public class CacheMetrics {
     /** 写回侧版本核验失败：快照落后于 DB，放弃写回。每次出现 = 撞上一次"重建期间并发更新" */
     public void staleSkip() {
         recorder.increment(CACHE_STALE_SKIP);
+    }
+
+    /** 写后缓存失效最终结果，用于暴露静默依赖 TTL 收敛的场景 */
+    public void evicted(boolean success) {
+        recorder.increment(CACHE_EVICT, "result", success ? "ok" : "error");
     }
 }

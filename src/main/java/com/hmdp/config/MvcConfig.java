@@ -29,7 +29,9 @@ public class MvcConfig implements WebMvcConfigurer {
                         "/upload/**",
                         "/blog/hot",
                         "/user/code",
-                        "/user/login"
+                        "/user/login",
+                        "/user/logout",
+                        "/error"
                 ).order(1);
         // 逐个 path 精确挂载，不用 /voucher-order/seckill/** —— 后者会把领券与结果查询
         // 全部塞进同一个限流桶，用户轮询几次就烧光自己的领券配额。
