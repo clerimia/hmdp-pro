@@ -52,6 +52,9 @@ docker-compose.override.yml
 loadtest/cache/results/
 jmeter.log
 
+### 图形编辑器自动备份（drawio 的 ".$xxx.bkp"）###
+.*.bkp
+
 ### hm-dianping-frontend：nginx 部署目录，只保留 H5 被测页面 ###
 hm-dianping-frontend/logs/
 hm-dianping-frontend/temp/
